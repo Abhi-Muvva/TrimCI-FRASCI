@@ -55,6 +55,7 @@ class Config:
     orbopt: bool = True
     optimizer: str = "auto_bfgs"   # auto_bfgs | cpp_bfgs | bfgs | gpu_bfgs
     orbopt_cycles: int = 10
+    save_fcidumps: bool = True  # retain per-cycle/final FCIDUMP snapshots
     # Phase 0 orbopt cycle behavior:
     #   tracking_dets=True carries dets between cycles (instead of fresh random
     #   stochastic exploration each cycle). loaded_dets_randomness > 0 adds a
@@ -978,6 +979,7 @@ def _config_to_phase_dicts(cfg: Config) -> tuple[dict, list[dict]]:
         "optimizer_options_dict": {
             "optimizer": cfg.optimizer,
             "cycles": cfg.orbopt_cycles,
+            "save_fcidumps": cfg.save_fcidumps,
             "maxiter": 100,
             "tracking_dets": cfg.tracking_dets,
             "davidson_tol": 1e-7,

@@ -55,6 +55,7 @@ def run_orbital_optimization(h1, eri, n_alpha, n_beta, n_orb, mol_name, args, nu
         tracking_dets       (False)        reuse same det list across cycles
         select_best_cycle   (True)         return the lowest-energy cycle's orbitals
         record_optimization (False)        save per-step BFGS log (large)
+        save_fcidumps      (True)         save per-cycle/final FCIDUMP snapshots
         dets_schedule       (None)         override max_final_dets per cycle
                                            e.g. [64, "32*5", 16]
         num_runs_schedule   (None)         override num_runs per cycle
@@ -104,6 +105,7 @@ def run_orbital_optimization(h1, eri, n_alpha, n_beta, n_orb, mol_name, args, nu
         optimizer_options_dict['record_optimization'] = False
 
     num_cycles = optimizer_options_dict['cycles']
+    save_fcidumps = bool(optimizer_options_dict.get('save_fcidumps', True))
     dets_schedule = _expand_schedule(optimizer_options_dict.get('dets_schedule', None))
     num_runs_schedule = _expand_schedule(optimizer_options_dict.get('num_runs_schedule', None))
 
@@ -268,10 +270,13 @@ def run_orbital_optimization(h1, eri, n_alpha, n_beta, n_orb, mol_name, args, nu
         current_h1 = new_h1
         current_eri = new_eri
 
-        # Save intermediate FCIDUMP
-        fcidump_path = os.path.join(orbopt_dir, f"fcidump_cycle_{cycle+1}")
-        _save_fcidump(orblab, tools, fcidump_path, current_h1, current_eri, psym, n_orb, n_elec, nuclear_repulsion, ms2)
-        log_orbopt(f"  Saved intermediate FCIDUMP to {fcidump_path}")
+        # Optional diagnostic snapshot. The in-memory integrals continue into
+        # the CI rerun, so this file is not required by the calculation.
+        if save_fcidumps:
+            fcidump_path = os.path.join(orbopt_dir, f"fcidump_cycle_{cycle+1}")
+            _save_fcidump(orblab, tools, fcidump_path, current_h1, current_eri,
+                          psym, n_orb, n_elec, nuclear_repulsion, ms2)
+            log_orbopt(f"  Saved intermediate FCIDUMP to {fcidump_path}")
 
         # Re-run CI with new integrals
         log_orbopt("  Re-running CI with new orbitals...")
@@ -365,10 +370,13 @@ def run_orbital_optimization(h1, eri, n_alpha, n_beta, n_orb, mol_name, args, nu
         final_U_total = U_total
         final_cycle_idx = num_cycles
 
-    # Save final orbitals (from the best cycle, not necessarily the last)
-    final_fcidump_path = os.path.join(orbopt_dir, "fcidump_orbopt")
-    _save_fcidump(orblab, tools, final_fcidump_path, final_h1, final_eri, psym, n_orb, n_elec, nuclear_repulsion, ms2)
-    log_orbopt(f"Saved final optimized orbitals to {final_fcidump_path}")
+    # Optional final diagnostic snapshot (best cycle, not necessarily last).
+    final_fcidump_path = None
+    if save_fcidumps:
+        final_fcidump_path = os.path.join(orbopt_dir, "fcidump_orbopt")
+        _save_fcidump(orblab, tools, final_fcidump_path, final_h1, final_eri,
+                      psym, n_orb, n_elec, nuclear_repulsion, ms2)
+        log_orbopt(f"Saved final optimized orbitals to {final_fcidump_path}")
 
     # Save the selected state's dets + rotation matrix, matching the
     # per-cycle npz schema so downstream readers (e.g. extract_p_trajectory)
@@ -396,7 +404,7 @@ def run_orbital_optimization(h1, eri, n_alpha, n_beta, n_orb, mol_name, args, nu
         coeffs=final_coeffs,
         source=best_source if select_best_cycle else f"cycle_{num_cycles}_last",
         selected_cycle=final_cycle_idx,
-        fcidump_orbopt_path=final_fcidump_path,
+        fcidump_orbopt_path=(final_fcidump_path or ""),
         orbopt_dir=orbopt_dir,
         details=details_serializable,
         run_args=run_args_serializable,
