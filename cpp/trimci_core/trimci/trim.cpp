@@ -835,29 +835,34 @@ run_trim_t(
     }
 
     auto current_pool = params_initial_pool;
-    auto core_dets = external_core_dets;
 
-    // Build core coefficient map for Davidson warm start.
-    // Built from external_core_dets/core_coeffs BEFORE P_K is merged in below,
-    // so appending protected determinants can never break the size==size
-    // precondition and silently disable the warm start.
+    // Build core coefficient map for Davidson warm start from the full mutable
+    // warm-start core (external_core_dets/core_coeffs), independent of what
+    // gets forced into TRIM below. A previously-selected R/O determinant that
+    // is no longer forced should still get a good initial guess if the pool
+    // competition re-selects it.
     std::unordered_map<DeterminantT<StorageType>, double> core_coeff_map;
-    if (!core_coeffs.empty() && core_coeffs.size() == core_dets.size()) {
-        for (size_t i = 0; i < core_dets.size(); ++i) {
-            core_coeff_map[core_dets[i]] = core_coeffs[i];
+    if (!core_coeffs.empty() && core_coeffs.size() == external_core_dets.size()) {
+        for (size_t i = 0; i < external_core_dets.size(); ++i) {
+            core_coeff_map[external_core_dets[i]] = core_coeffs[i];
         }
     }
 
-    // Milestone C2b-2: force the immutable protected seed into the core, so it
-    // is present in every group subspace (core_dets is appended to each) and
-    // in the final selection (core_dets is appended unconditionally at the end
-    // of each round). Protected members absent from the warm-start core simply
-    // get guess coefficient 0 via make_initial_guess.
-    if (protected_dets && !protected_dets->empty()) {
-        std::unordered_set<DeterminantT<StorageType>> already(core_dets.begin(), core_dets.end());
-        for (const auto& d : *protected_dets) {
-            if (already.insert(d).second) core_dets.push_back(d);
-        }
+    // Milestone C2b-2 correction: the set unconditionally forced into every
+    // TRIM group subspace and the final selection below (core_dets) is NOT
+    // the whole mutable warm-start core -- it is ONLY the immutable protected
+    // seed P_K when one is supplied. A previously-selected R or O determinant
+    // is just a regular pool member (already present in current_pool via
+    // pool_build_t's infinite-score retention of the input core, see
+    // screening.cpp) and must compete for retention in TRIM like any other
+    // candidate, so it can genuinely be dropped. Unfiltered callers
+    // (protected_dets == nullptr) keep the prior behavior unchanged: the
+    // entire external_core_dets set is forced.
+    std::vector<DeterminantT<StorageType>> core_dets;
+    if (protected_dets) {
+        core_dets.assign(protected_dets->begin(), protected_dets->end());
+    } else {
+        core_dets = external_core_dets;
     }
 
     // Helper: construct initial guess for a det set from core coefficients

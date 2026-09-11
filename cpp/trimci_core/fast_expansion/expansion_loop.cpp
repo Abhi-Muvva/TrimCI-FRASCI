@@ -1335,6 +1335,14 @@ ExpansionResult<StorageType> run_expansion(
                 result.termination_reason = "recovery_target_met";
             } else if (stage.pool.saturation_reason == SaturationReason::WorkingMemoryCeiling) {
                 result.termination_reason = "work_limit";
+            } else if (stage.pool.saturation_reason != SaturationReason::None) {
+                // FrontierExhausted / ThresholdFloor / RoundLimit: pool_build_t's
+                // own stagnant-rounds detector reported genuine no-more-growth
+                // within this round's native screening call, not the outer
+                // loop's growth-ratio heuristic (which is unreliable for filtered
+                // saturation -- see the disabled energy_converged/space_converged
+                // checks below).
+                result.termination_reason = "filtered_saturated";
             }
             if (!result.termination_reason.empty()) {
                 if (config.verbose >= 1) {
@@ -1353,7 +1361,13 @@ ExpansionResult<StorageType> run_expansion(
             prev_energy = energy;
             break;
         }
-        if (energy_converged) {
+        // Both checks below are ordinary-TrimCI heuristics (energy plateau /
+        // growth-ratio slowdown) and are disabled for filtered recovery runs:
+        // a filtered round only reaches this point when its recovery target
+        // is still unmet (target_met already broke out above), and the
+        // growth-ratio heuristic is not proof of genuine filter saturation --
+        // that's reported natively as "filtered_saturated"/"work_limit" above.
+        if (!filtered && energy_converged) {
             if (config.verbose >= 1) {
                 std::cout << "[FE] Energy converged: |dE| = "
                     << std::scientific << std::setprecision(2)
@@ -1364,7 +1378,7 @@ ExpansionResult<StorageType> run_expansion(
             prev_energy = energy;
             break;
         }
-        if (space_converged) {
+        if (!filtered && space_converged) {
             if (config.verbose >= 1) {
                 std::cout << "[FE] Space converged, no more dets to add." << std::endl;
             }
