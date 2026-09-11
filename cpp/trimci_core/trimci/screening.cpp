@@ -353,7 +353,8 @@ pool_build_t(
     const IntegralSparsityInfo* precomputed_sparsity,
     const DoubleExcTable* precomputed_table,
     const SectorConstraint<StorageType>* sector_constraint,
-    ScreeningTelemetry* telemetry_out
+    ScreeningTelemetry* telemetry_out,
+    FilteredGrowthResult* filtered_result_out
 ) {
     // Extract parameters from struct
     const std::string& screening_mode = params.screening_mode;
@@ -453,6 +454,66 @@ pool_build_t(
     // Untouched when sector_constraint is nullptr (disabled path).
     ScreeningTelemetry aggregate_telemetry;
 
+    // Milestone C2b-1: filtered-growth policy is an explicit opt-in
+    // (sector_constraint->recovery_target > 0). A constraint can be active
+    // purely for candidate filtering (C2a) while pool_build_t still uses
+    // classic pool_map.size() stopping -- this flag, not sector_constraint
+    // alone, is what switches the stopping/truncation/accounting behavior.
+    const bool filtered_growth_active = sector_constraint && sector_constraint->recovery_target > 0;
+    FilteredGrowthResult filtered_result;
+    fe::fe_map<DeterminantT<StorageType>, SectorLabel, fe::DetHash<StorageType>> pool_labels;
+    if (filtered_growth_active) {
+        // Classify the initial pool ONCE. Throws if a nonprotected member is
+        // las_present or ct_disallowed -- the admission rule would never have
+        // produced it, so it cannot be seeded directly.
+        std::vector<SectorLabel> initial_labels = classify_initial_pool_t(initial_pool, *sector_constraint);
+        for (size_t i = 0; i < initial_pool.size(); ++i) {
+            pool_labels[initial_pool[i]] = initial_labels[i];
+            switch (initial_labels[i]) {
+                case SectorLabel::Protected: filtered_result.n_protected++; break;
+                case SectorLabel::Dispersion:
+                case SectorLabel::CtAllowed: filtered_result.n_recovery++; break;
+                case SectorLabel::LasAbsent: filtered_result.n_aux++; break;
+                default: break;
+            }
+        }
+        filtered_result.n_work = pool_map.size();
+    }
+    // Unifies the two stopping regimes: classic (pool_map.size() vs
+    // target_size, C2a and earlier, unchanged) and filtered growth (unique
+    // N_recovery vs recovery_target, C2b-1, never total pool size).
+    auto growth_metric = [&]() -> size_t {
+        return filtered_growth_active ? static_cast<size_t>(filtered_result.n_recovery) : pool_map.size();
+    };
+    const size_t growth_target = filtered_growth_active ? sector_constraint->recovery_target : target_size;
+
+    // Shared by all three insertion sites (heat_bath merge, PT2 aggregation,
+    // PT2 heat_bath_pt2) so the doorway/work-memory/composition rules are
+    // defined exactly once, not per candidate-buffer shape.
+    auto filtered_insertion_blocked = [&](SectorLabel label) -> bool {
+        if (!filtered_growth_active) return false;
+        return label == SectorLabel::LasAbsent && filtered_result.n_aux >= sector_constraint->doorway_limit;
+    };
+    auto filtered_work_memory_full = [&]() -> bool {
+        return filtered_growth_active && filtered_result.n_work >= sector_constraint->max_work_memory;
+    };
+    auto account_filtered_insertion = [&](const DeterminantT<StorageType>& det, SectorLabel label) {
+        pool_labels[det] = label;
+        switch (label) {
+            case SectorLabel::Protected: filtered_result.n_protected++; break;
+            case SectorLabel::Dispersion:
+            case SectorLabel::CtAllowed: filtered_result.n_recovery++; break;
+            case SectorLabel::LasAbsent:
+                filtered_result.n_aux++;
+                if (filtered_result.n_aux >= sector_constraint->doorway_limit) {
+                    filtered_result.doorway_limit_reached = true;
+                }
+                break;
+            default: break;  // LasPresent/CtDisallowed never reach an insertion site
+        }
+        filtered_result.n_work++;
+    };
+
     // Control whether to use coefficient map
     bool use_coeffs = !initial_coeffs.empty();
 
@@ -538,19 +599,25 @@ pool_build_t(
     std::atomic<bool> reached{false};
     size_t prev_pool_size = pool_map.size();
     int stagnant_rounds = 0;
+    // Milestone C2b-1: distinct from `reached` (which means "target met") --
+    // this means "growth cannot continue and the target was NOT met," e.g. the
+    // independent working-memory ceiling. Latches permanently once set.
+    bool filtered_saturated = false;
 
-    while (pool_map.size() < target_size) {
+    while (growth_metric() < growth_target) {
         if (frontier.empty() || (max_rounds > 0 && round > max_rounds)) {
-            if (pool_map.size() < target_size) {
+            bool round_limit_hit = (max_rounds > 0 && round > max_rounds) && !frontier.empty();
+            if (growth_metric() < growth_target) {
                 // Check if threshold is too small or no progress is being made
                 if (threshold < min_threshold) {
                 if (verbosity >= 1) {
                     std::cout << "[PoolBuild] threshold too small (" << std::scientific << std::setprecision(4) << threshold
                               << " < " << min_threshold << std::defaultfloat << "), stopping to prevent infinite loop." << std::endl;
                 }
+                    if (filtered_growth_active) filtered_result.saturation_reason = SaturationReason::ThresholdFloor;
                     break;
                 }
-                size_t current_pool = pool_map.size();
+                size_t current_pool = growth_metric();
                 size_t gained = current_pool - prev_pool_size;
                 if (gained == 0) {
                     stagnant_rounds++;
@@ -558,6 +625,10 @@ pool_build_t(
                         if (verbosity >= 1) {
                             std::cout << "[PoolBuild] no progress for " << max_stagnant_rounds_param
                                   << " threshold reductions, stopping." << std::endl;
+                        }
+                        if (filtered_growth_active) {
+                            filtered_result.saturation_reason = round_limit_hit
+                                ? SaturationReason::RoundLimit : SaturationReason::FrontierExhausted;
                         }
                         break;
                     }
@@ -573,7 +644,7 @@ pool_build_t(
                 frontier = build_filtered_frontier(threshold);
                 if (verbosity >= 1) {
                     std::cout << "[PoolBuild] pool=" << current_pool
-                          << "/" << target_size
+                          << "/" << growth_target
                           << " (+" << gained << " new), threshold "
                           << std::scientific << std::setprecision(4)
                           << old_threshold << " → " << threshold
@@ -596,7 +667,9 @@ pool_build_t(
         }
 
         std::vector<DeterminantT<StorageType>> new_frontier;
-        new_frontier.reserve(target_size - pool_map.size());  // avoid reallocation
+        new_frontier.reserve(filtered_growth_active
+            ? frontier.size()
+            : (target_size > pool_map.size() ? target_size - pool_map.size() : size_t(0)));
 
         // Candidate definition for deferred processing (PT2 modes only)
         // Added h_jj for PT2 denominator, screening_score for final ranking
@@ -607,6 +680,7 @@ pool_build_t(
             double est_cj;
             double h_jj;            // Diagonal element H_jj (for PT2)
             double screening_score; // Final score used for selection
+            SectorLabel label;      // Milestone C2b-1: unused unless sector_constraint is set
         };
 
         // Lightweight candidate for heat_bath mode (32 bytes vs 64 bytes)
@@ -615,6 +689,7 @@ pool_build_t(
             DeterminantT<StorageType> child;
             double score;      // |hij * ci|
             double parent_ci;  // parent's |c_i| for coeff_map in subsequent rounds
+            SectorLabel label; // Milestone C2b-1: unused unless sector_constraint is set
         };
 
         #ifdef _OPENMP
@@ -675,8 +750,10 @@ pool_build_t(
                             double hij = pr.second;
                             bool hb_pass = std::abs(hij) > local_threshold;
                             bool sector_admit = true;
+                            SectorLabel candidate_label = SectorLabel::Dispersion;  // unused unless sector_constraint
                             if (hb_pass && sector_constraint) {
                                 SectorClassification result = screen_candidate_t(dj, *sector_constraint);
+                                candidate_label = result.label;
                                 int label_idx = static_cast<int>(result.label);
                                 thread_telemetry[tid].hb_passing[label_idx]++;
                                 if (result.admitted) {
@@ -718,7 +795,7 @@ pool_build_t(
                                         }
                                     heat_bath_score *= (1.0 + mi_alpha * mi_w);
                                 }
-                                thread_light_candidates[tid].push_back({dj, heat_bath_score, abs_ci});
+                                thread_light_candidates[tid].push_back({dj, heat_bath_score, abs_ci, candidate_label});
                             }
                         }
                     }
@@ -731,6 +808,7 @@ pool_build_t(
                 // P5: Merge this chunk's candidates into pool_map (MAX score update)
                 size_t chunk_candidates = 0;
                 bool pool_capped = false;
+                bool work_memory_capped = false;
                 for (int t = 0; t < n_threads; ++t) {
                     for (const auto& cand : thread_light_candidates[t]) {
                         // max_pool_size: stop merging when pool is large enough
@@ -740,19 +818,33 @@ pool_build_t(
                             pool_capped = true;
                             break;
                         }
+                        // Milestone C2b-1: the doorway limit blocks ONLY new las_absent (O)
+                        // insertions -- R and P_K must still be able to enter after it is
+                        // reached, so this is a `continue` (skip this one candidate), never
+                        // a `break` (stop the whole merge).
+                        if (filtered_insertion_blocked(cand.label)) {
+                            continue;
+                        }
+                        // The independent working-memory ceiling, unlike the doorway limit,
+                        // blocks every class once N_work is exhausted.
+                        if (filtered_work_memory_full()) {
+                            work_memory_capped = true;
+                            break;
+                        }
                         auto [it, inserted] = pool_map.try_emplace(cand.child, cand.score);
                         if (inserted) {
                             new_frontier.push_back(cand.child);
                             if (use_coeffs && !single_pass_mode) {
                                 coeff_map[cand.child] = cand.parent_ci;
                             }
+                            if (filtered_growth_active) account_filtered_insertion(cand.child, cand.label);
                         } else if (use_coeffs && cand.score > it->second && !std::isinf(it->second)) {
                             // Update to MAX score (skip initial dets with INFINITY)
                             it->second = cand.score;
                         }
                     }
                     chunk_candidates += thread_light_candidates[t].size();
-                    if (pool_capped) break;
+                    if (pool_capped || work_memory_capped) break;
                 }
                 total_candidates_processed += chunk_candidates;
 
@@ -762,6 +854,15 @@ pool_build_t(
                                   << "), stopping merge." << std::endl;
                     }
                     reached.store(true);
+                    break;
+                }
+                if (work_memory_capped) {
+                    if (verbosity >= 1) {
+                        std::cout << "[PoolBuild] max_work_memory reached ("
+                                  << sector_constraint->max_work_memory << "), stopping merge." << std::endl;
+                    }
+                    filtered_result.saturation_reason = SaturationReason::WorkingMemoryCeiling;
+                    filtered_saturated = true;
                     break;
                 }
 
@@ -775,7 +876,7 @@ pool_build_t(
                               << std::endl;
                 }
 
-                if (params.early_stop && pool_map.size() >= target_size) {
+                if (params.early_stop && growth_metric() >= growth_target) {
                     reached.store(true);
                     break;
                 }
@@ -808,7 +909,7 @@ pool_build_t(
             }
 
             // Check target after all chunks
-            if (pool_map.size() >= target_size) {
+            if (growth_metric() >= growth_target) {
                 reached.store(true);
             }
         } else {
@@ -842,8 +943,10 @@ pool_build_t(
                     double hij = pr.second;
                     bool hb_pass = std::abs(hij) > local_threshold;
                     bool sector_admit = true;
+                    SectorLabel candidate_label = SectorLabel::Dispersion;  // unused unless sector_constraint
                     if (hb_pass && sector_constraint) {
                         SectorClassification result = screen_candidate_t(dj, *sector_constraint);
+                        candidate_label = result.label;
                         int label_idx = static_cast<int>(result.label);
                         thread_telemetry_pt2[tid].hb_passing[label_idx]++;
                         if (result.admitted) {
@@ -855,7 +958,7 @@ pool_build_t(
                     }
                     if (hb_pass && sector_admit) {
                         double heat_bath_score = std::abs(hij * abs_ci);
-                        thread_candidates[tid].push_back({det, dj, hij, abs_ci, 0.0, heat_bath_score});
+                        thread_candidates[tid].push_back({det, dj, hij, abs_ci, 0.0, heat_bath_score, candidate_label});
                     }
                 }
             }
@@ -935,6 +1038,7 @@ pool_build_t(
                 fe::fe_map<DeterminantT<StorageType>, double, fe::DetHash<StorageType>> child_best_hij;
                 fe::fe_map<DeterminantT<StorageType>, double, fe::DetHash<StorageType>> child_best_score;
                 fe::fe_map<DeterminantT<StorageType>, double, fe::DetHash<StorageType>> child_best_est_cj;
+                fe::fe_map<DeterminantT<StorageType>, SectorLabel, fe::DetHash<StorageType>> child_label;
 
                 for (size_t i = 0; i < pre_filter_count; ++i) {
                     const auto& cand = all_candidates[i];
@@ -945,6 +1049,7 @@ pool_build_t(
                         child_best_hij[cand.child] = cand.hij;
                         child_best_score[cand.child] = cand.screening_score;
                         child_best_est_cj[cand.child] = cand.est_cj;
+                        child_label[cand.child] = cand.label;
                     } else {
                         it->second += cand.screening_score;
                         if (cand.screening_score > child_best_score[cand.child]) {
@@ -955,7 +1060,7 @@ pool_build_t(
                         }
                     }
                 }
-                
+
                 // Sort by aggregated score
                 std::vector<std::pair<DeterminantT<StorageType>, double>> sorted_children;
                 sorted_children.reserve(child_aggregated_score.size());
@@ -964,42 +1069,52 @@ pool_build_t(
                 }
                 std::sort(sorted_children.begin(), sorted_children.end(),
                          [](const auto& a, const auto& b) { return a.second > b.second; });
-                
+
                 for (const auto& [child, agg_score] : sorted_children) {
+                    SectorLabel label = filtered_growth_active ? child_label[child] : SectorLabel::Dispersion;
+                    if (filtered_insertion_blocked(label)) continue;
+                    if (filtered_work_memory_full()) { filtered_saturated = true;
+                        filtered_result.saturation_reason = SaturationReason::WorkingMemoryCeiling; break; }
                     auto [it, inserted] = pool_map.try_emplace(child, agg_score);
                     if (inserted) {
                         new_frontier.push_back(child);
                         if (use_coeffs && !single_pass_mode) {
                             coeff_map[child] = child_best_est_cj[child];
                         }
+                        if (filtered_growth_active) account_filtered_insertion(child, label);
                     }
                 }
                 // Check target after processing all aggregated candidates
-                if (pool_map.size() >= target_size) {
+                if (growth_metric() >= growth_target) {
                     reached.store(true);
                 }
             } else {
                 // heat_bath_pt2: add pre-filtered candidates in PT2 score order
                 for (size_t i = 0; i < pre_filter_count; ++i) {
                     const auto& cand = all_candidates[i];
+                    if (filtered_insertion_blocked(cand.label)) continue;
+                    if (filtered_work_memory_full()) { filtered_saturated = true;
+                        filtered_result.saturation_reason = SaturationReason::WorkingMemoryCeiling; break; }
                     auto [it, inserted] = pool_map.try_emplace(cand.child, cand.screening_score);
                     if (inserted) {
                         new_frontier.push_back(cand.child);
                         if (use_coeffs && !single_pass_mode) {
                             coeff_map[cand.child] = cand.est_cj;
                         }
+                        if (filtered_growth_active) account_filtered_insertion(cand.child, cand.label);
                     }
                 }
                 // Check target after processing all pre-filtered candidates
-                if (pool_map.size() >= target_size) {
+                if (growth_metric() >= growth_target) {
                     reached.store(true);
                 }
             }
         } // end PT2 modes
 
-        if (reached.load()) {
+        if (reached.load() || filtered_saturated) {
             if (verbosity >= 1) {
-                std::cout << "[PoolBuild] target_size reached, stopping.\n";
+                std::cout << (reached.load() ? "[PoolBuild] target_size reached, stopping.\n"
+                                             : "[PoolBuild] filtered growth saturated, stopping.\n");
             }
             frontier.swap(new_frontier);
             break;
@@ -1027,8 +1142,51 @@ pool_build_t(
         final_pool.push_back(det);
     }
     
-    // Strict target size truncation: always keep initial_pool dets (variational guarantee)
-    if (params.strict_target_size && final_pool.size() > target_size) {
+    // Milestone C2b-1: category-aware strict truncation for filtered growth --
+    // a DIFFERENT contract from the classic branch below, not an extension of
+    // it. Always retains every P_K member (not "the whole initial pool" --
+    // C2b-1 explicitly does not auto-protect nonprotected initial-pool
+    // members), retains at most recovery_target R members by score, and at
+    // most doorway_limit O members by score.
+    if (params.strict_target_size && filtered_growth_active) {
+        auto score_of = [&](const DeterminantT<StorageType>& d) -> double {
+            auto it = pool_map.find(d);
+            return (it != pool_map.end()) ? std::abs(it->second) : 0.0;
+        };
+        std::vector<DeterminantT<StorageType>> kept_protected, kept_recovery, kept_aux;
+        for (auto& d : final_pool) {
+            auto it = pool_labels.find(d);
+            SectorLabel label = (it != pool_labels.end()) ? it->second : SectorLabel::Dispersion;
+            switch (label) {
+                case SectorLabel::Protected: kept_protected.push_back(d); break;
+                case SectorLabel::Dispersion:
+                case SectorLabel::CtAllowed: kept_recovery.push_back(d); break;
+                case SectorLabel::LasAbsent: kept_aux.push_back(d); break;
+                default: break;  // unreachable: never inserted with this label
+            }
+        }
+        auto by_score_desc = [&](const DeterminantT<StorageType>& a, const DeterminantT<StorageType>& b) {
+            return score_of(a) > score_of(b);
+        };
+        std::sort(kept_recovery.begin(), kept_recovery.end(), by_score_desc);
+        if (kept_recovery.size() > sector_constraint->recovery_target) {
+            kept_recovery.resize(sector_constraint->recovery_target);
+        }
+        std::sort(kept_aux.begin(), kept_aux.end(), by_score_desc);
+        if (sector_constraint->doorway_limit != std::numeric_limits<size_t>::max()
+            && kept_aux.size() > sector_constraint->doorway_limit) {
+            kept_aux.resize(sector_constraint->doorway_limit);
+        }
+        if (verbosity >= 1) {
+            std::cout << "[PoolBuild] Filtered strict truncation: P_K=" << kept_protected.size()
+                      << ", R " << final_pool.size() << "->" << kept_recovery.size()
+                      << ", O " << kept_aux.size() << std::endl;
+        }
+        final_pool.clear();
+        final_pool.insert(final_pool.end(), kept_protected.begin(), kept_protected.end());
+        final_pool.insert(final_pool.end(), kept_recovery.begin(), kept_recovery.end());
+        final_pool.insert(final_pool.end(), kept_aux.begin(), kept_aux.end());
+    } else if (params.strict_target_size && final_pool.size() > target_size) {
         auto t_trunc = std::chrono::high_resolution_clock::now();
 
         // Partition: initial dets first, new dets after
@@ -1090,6 +1248,31 @@ pool_build_t(
         *telemetry_out = aggregate_telemetry;
     }
 
+    if (filtered_growth_active && filtered_result_out) {
+        // Milestone C2b-1: NEVER report pre-truncation counts -- recompute
+        // composition from the actual returned final_pool, whether or not
+        // strict truncation ran (with strict_target_size off, final_pool ==
+        // the untruncated pool_map contents, and this recompute is still the
+        // authoritative source of truth rather than the running counters).
+        FilteredGrowthResult recomputed;
+        recomputed.saturation_reason = filtered_result.saturation_reason;
+        for (const auto& d : final_pool) {
+            auto it = pool_labels.find(d);
+            SectorLabel label = (it != pool_labels.end()) ? it->second : SectorLabel::Dispersion;
+            switch (label) {
+                case SectorLabel::Protected: recomputed.n_protected++; break;
+                case SectorLabel::Dispersion:
+                case SectorLabel::CtAllowed: recomputed.n_recovery++; break;
+                case SectorLabel::LasAbsent: recomputed.n_aux++; break;
+                default: break;
+            }
+        }
+        recomputed.n_work = final_pool.size();
+        recomputed.recovery_target_met = recomputed.n_recovery >= sector_constraint->recovery_target;
+        recomputed.doorway_limit_reached = filtered_result.doorway_limit_reached;
+        *filtered_result_out = recomputed;
+    }
+
     return {final_pool, threshold};
 }
 
@@ -1145,17 +1328,17 @@ template std::pair<std::vector<DeterminantT<uint64_t>>, double>
 pool_build_t<uint64_t>(const std::vector<DeterminantT<uint64_t>>&, std::vector<double>, int,
                        const std::vector<std::vector<double>>&,
                        const std::vector<double>&,
-                       double, size_t, HijCacheT<uint64_t>&, const std::string&, const std::vector<int>&, int, const PoolBuildParams&, const IntegralSparsityInfo*, const DoubleExcTable*, const SectorConstraint<uint64_t>*, ScreeningTelemetry*);
+                       double, size_t, HijCacheT<uint64_t>&, const std::string&, const std::vector<int>&, int, const PoolBuildParams&, const IntegralSparsityInfo*, const DoubleExcTable*, const SectorConstraint<uint64_t>*, ScreeningTelemetry*, FilteredGrowthResult*);
 template std::pair<std::vector<DeterminantT<std::array<uint64_t, 2>>>, double>
 pool_build_t<std::array<uint64_t, 2>>(const std::vector<DeterminantT<std::array<uint64_t, 2>>>&, std::vector<double>, int,
                                       const std::vector<std::vector<double>>&,
                                       const std::vector<double>&,
-                                      double, size_t, HijCacheT<std::array<uint64_t, 2>>&, const std::string&, const std::vector<int>&, int, const PoolBuildParams&, const IntegralSparsityInfo*, const DoubleExcTable*, const SectorConstraint<std::array<uint64_t, 2>>*, ScreeningTelemetry*);
+                                      double, size_t, HijCacheT<std::array<uint64_t, 2>>&, const std::string&, const std::vector<int>&, int, const PoolBuildParams&, const IntegralSparsityInfo*, const DoubleExcTable*, const SectorConstraint<std::array<uint64_t, 2>>*, ScreeningTelemetry*, FilteredGrowthResult*);
 template std::pair<std::vector<DeterminantT<std::array<uint64_t, 3>>>, double>
 pool_build_t<std::array<uint64_t, 3>>(const std::vector<DeterminantT<std::array<uint64_t, 3>>>&, std::vector<double>, int,
                                       const std::vector<std::vector<double>>&,
                                       const std::vector<double>&,
-                                      double, size_t, HijCacheT<std::array<uint64_t, 3>>&, const std::string&, const std::vector<int>&, int, const PoolBuildParams&, const IntegralSparsityInfo*, const DoubleExcTable*, const SectorConstraint<std::array<uint64_t, 3>>*, ScreeningTelemetry*);
+                                      double, size_t, HijCacheT<std::array<uint64_t, 3>>&, const std::string&, const std::vector<int>&, int, const PoolBuildParams&, const IntegralSparsityInfo*, const DoubleExcTable*, const SectorConstraint<std::array<uint64_t, 3>>*, ScreeningTelemetry*, FilteredGrowthResult*);
 
 template std::vector<std::pair<DeterminantT<std::array<uint64_t, 4>>, double>>
 process_parent_worker_t<std::array<uint64_t, 4>>(const DeterminantT<std::array<uint64_t, 4>>&, int, double, const DoubleExcTable&,
@@ -1192,26 +1375,26 @@ template std::pair<std::vector<DeterminantT<std::array<uint64_t, 4>>>, double>
 pool_build_t<std::array<uint64_t, 4>>(const std::vector<DeterminantT<std::array<uint64_t, 4>>>&, std::vector<double>, int,
                                       const std::vector<std::vector<double>>&,
                                       const std::vector<double>&,
-                                      double, size_t, HijCacheT<std::array<uint64_t, 4>>&, const std::string&, const std::vector<int>&, int, const PoolBuildParams&, const IntegralSparsityInfo*, const DoubleExcTable*, const SectorConstraint<std::array<uint64_t, 4>>*, ScreeningTelemetry*);
+                                      double, size_t, HijCacheT<std::array<uint64_t, 4>>&, const std::string&, const std::vector<int>&, int, const PoolBuildParams&, const IntegralSparsityInfo*, const DoubleExcTable*, const SectorConstraint<std::array<uint64_t, 4>>*, ScreeningTelemetry*, FilteredGrowthResult*);
 template std::pair<std::vector<DeterminantT<std::array<uint64_t, 5>>>, double>
 pool_build_t<std::array<uint64_t, 5>>(const std::vector<DeterminantT<std::array<uint64_t, 5>>>&, std::vector<double>, int,
                                       const std::vector<std::vector<double>>&,
                                       const std::vector<double>&,
-                                      double, size_t, HijCacheT<std::array<uint64_t, 5>>&, const std::string&, const std::vector<int>&, int, const PoolBuildParams&, const IntegralSparsityInfo*, const DoubleExcTable*, const SectorConstraint<std::array<uint64_t, 5>>*, ScreeningTelemetry*);
+                                      double, size_t, HijCacheT<std::array<uint64_t, 5>>&, const std::string&, const std::vector<int>&, int, const PoolBuildParams&, const IntegralSparsityInfo*, const DoubleExcTable*, const SectorConstraint<std::array<uint64_t, 5>>*, ScreeningTelemetry*, FilteredGrowthResult*);
 template std::pair<std::vector<DeterminantT<std::array<uint64_t, 6>>>, double>
 pool_build_t<std::array<uint64_t, 6>>(const std::vector<DeterminantT<std::array<uint64_t, 6>>>&, std::vector<double>, int,
                                       const std::vector<std::vector<double>>&,
                                       const std::vector<double>&,
-                                      double, size_t, HijCacheT<std::array<uint64_t, 6>>&, const std::string&, const std::vector<int>&, int, const PoolBuildParams&, const IntegralSparsityInfo*, const DoubleExcTable*, const SectorConstraint<std::array<uint64_t, 6>>*, ScreeningTelemetry*);
+                                      double, size_t, HijCacheT<std::array<uint64_t, 6>>&, const std::string&, const std::vector<int>&, int, const PoolBuildParams&, const IntegralSparsityInfo*, const DoubleExcTable*, const SectorConstraint<std::array<uint64_t, 6>>*, ScreeningTelemetry*, FilteredGrowthResult*);
 template std::pair<std::vector<DeterminantT<std::array<uint64_t, 7>>>, double>
 pool_build_t<std::array<uint64_t, 7>>(const std::vector<DeterminantT<std::array<uint64_t, 7>>>&, std::vector<double>, int,
                                       const std::vector<std::vector<double>>&,
                                       const std::vector<double>&,
-                                      double, size_t, HijCacheT<std::array<uint64_t, 7>>&, const std::string&, const std::vector<int>&, int, const PoolBuildParams&, const IntegralSparsityInfo*, const DoubleExcTable*, const SectorConstraint<std::array<uint64_t, 7>>*, ScreeningTelemetry*);
+                                      double, size_t, HijCacheT<std::array<uint64_t, 7>>&, const std::string&, const std::vector<int>&, int, const PoolBuildParams&, const IntegralSparsityInfo*, const DoubleExcTable*, const SectorConstraint<std::array<uint64_t, 7>>*, ScreeningTelemetry*, FilteredGrowthResult*);
 template std::pair<std::vector<DeterminantT<std::array<uint64_t, 8>>>, double>
 pool_build_t<std::array<uint64_t, 8>>(const std::vector<DeterminantT<std::array<uint64_t, 8>>>&, std::vector<double>, int,
                                       const std::vector<std::vector<double>>&,
                                       const std::vector<double>&,
-                                      double, size_t, HijCacheT<std::array<uint64_t, 8>>&, const std::string&, const std::vector<int>&, int, const PoolBuildParams&, const IntegralSparsityInfo*, const DoubleExcTable*, const SectorConstraint<std::array<uint64_t, 8>>*, ScreeningTelemetry*);
+                                      double, size_t, HijCacheT<std::array<uint64_t, 8>>&, const std::string&, const std::vector<int>&, int, const PoolBuildParams&, const IntegralSparsityInfo*, const DoubleExcTable*, const SectorConstraint<std::array<uint64_t, 8>>*, ScreeningTelemetry*, FilteredGrowthResult*);
 
 } // namespace trimci_core

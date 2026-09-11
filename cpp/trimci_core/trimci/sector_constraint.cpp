@@ -134,7 +134,40 @@ void validate_and_prepare_sector_constraint(SectorConstraint<StorageType>& const
         }
     }
 
+    // Milestone C2b-1: fail early if the filtered-growth policy is internally
+    // impossible, rather than after a doomed growth run.
+    if (constraint.recovery_target > 0) {
+        const size_t required = constraint.protected_determinants.size() + constraint.recovery_target;
+        if (constraint.max_work_memory < required) {
+            throw std::invalid_argument(
+                "SectorConstraint: max_work_memory (" + std::to_string(constraint.max_work_memory)
+                + ") cannot hold P_K (" + std::to_string(constraint.protected_determinants.size())
+                + ") plus the requested recovery_target (" + std::to_string(constraint.recovery_target) + ")");
+        }
+    }
+
     constraint.prepared = true;
+}
+
+template<typename StorageType>
+std::vector<SectorLabel> classify_initial_pool_t(
+    const std::vector<DeterminantT<StorageType>>& initial_pool,
+    const SectorConstraint<StorageType>& constraint)
+{
+    std::vector<SectorLabel> labels;
+    labels.reserve(initial_pool.size());
+    for (const auto& det : initial_pool) {
+        SectorClassification result = classify_determinant_t(det, constraint, /*heat_bath_passed=*/true);
+        if (result.label == SectorLabel::LasPresent || result.label == SectorLabel::CtDisallowed) {
+            throw std::invalid_argument(
+                "SectorConstraint: initial pool contains a nonprotected determinant classified as "
+                + std::string(result.label == SectorLabel::LasPresent ? "las_present" : "ct_disallowed")
+                + " -- the candidate-generation admission rule would never have produced this "
+                  "determinant, so it cannot be seeded directly");
+        }
+        labels.push_back(result.label);
+    }
+    return labels;
 }
 
 template<typename StorageType>
@@ -191,7 +224,9 @@ SectorClassification classify_determinant_t(
     template void validate_and_prepare_sector_constraint<__VA_ARGS__>(                     \
         SectorConstraint<__VA_ARGS__>&, int);                                              \
     template SectorClassification classify_determinant_t<__VA_ARGS__>(                     \
-        const DeterminantT<__VA_ARGS__>&, const SectorConstraint<__VA_ARGS__>&, bool);
+        const DeterminantT<__VA_ARGS__>&, const SectorConstraint<__VA_ARGS__>&, bool);     \
+    template std::vector<SectorLabel> classify_initial_pool_t<__VA_ARGS__>(                \
+        const std::vector<DeterminantT<__VA_ARGS__>>&, const SectorConstraint<__VA_ARGS__>&);
 
 TRIMCI_INSTANTIATE_SECTOR_CONSTRAINT(uint64_t)
 TRIMCI_INSTANTIATE_SECTOR_CONSTRAINT(std::array<uint64_t, 2>)

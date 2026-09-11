@@ -2,13 +2,16 @@
 
 // Filter-aware phased TrimCI interfragment recovery: native sector constraint,
 // classification/admission oracle, and screening-loop integration (Milestones
-// C1 + C2a).
+// C1, C2a, C2b-1).
 //
-// C2a wires this into pool_build_t's two direct candidate-generation paths
-// (screening.cpp) only. Phase 0/1/2 orchestration (iterative_workflow.cpp,
-// fast_expansion/expansion_loop.cpp), phase stopping logic, protected-seed
-// survival across truncation/restarts, and doorway/N_recovery accounting are
-// all still untouched -- that is Milestone C2b.
+// C2a wired classification into pool_build_t's two direct candidate-generation
+// paths (screening.cpp). C2b-1 adds unique recovery-pool composition
+// (N_protected/N_recovery/N_aux/N_work), recovery-target stopping, a doorway
+// insertion limit, and category-aware strict truncation -- all still inside
+// direct pool_build_t only. Phase 0/1/2 orchestration (iterative_workflow.cpp,
+// fast_expansion/expansion_loop.cpp), ExpansionConfig, run_trim_t, and
+// protected-seed survival across TRIM/core reselection and phase handoffs are
+// all still untouched -- that is Milestone C2b-2.
 //
 // Mirrors frasci.recovery._state.classify_recovery() exactly (Python oracle,
 // LASSCF_TRIMCI_COO/frasci/recovery/_state.py) -- same six labels, same truth
@@ -16,6 +19,8 @@
 
 #include <array>
 #include <cstdint>
+#include <limits>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -113,12 +118,59 @@ struct SectorConstraint {
     int n_ct_max = 2;
     bool allow_las_absent_owned = false;
 
+    // Milestone C2b-1 filtered-growth policy. Explicit opt-in: recovery_target
+    // == 0 (the default) means "filtered growth stopping is not requested" --
+    // pool_build_t keeps its original pool_map.size()-based stopping even with
+    // this constraint active for classification/filtering (exactly C2a's
+    // behavior, still available and still tested). recovery_target > 0 is the
+    // named "filtered-pool policy" that switches pool_build_t to stop on
+    // unique N_recovery, apply the doorway_limit, enforce max_work_memory, and
+    // use category-aware strict truncation -- never on total pool size.
+    size_t recovery_target = 0;
+    // Maximum unique admitted LAS-absent (doorway, O) pool members. Reaching
+    // this blocks further doorway insertions but never blocks recovery (R) or
+    // protected (P_K) insertions, and is not itself a saturation/stop reason.
+    size_t doorway_limit = std::numeric_limits<size_t>::max();
+    // Independent ceiling on unique total pool members (N_work), regardless of
+    // recovery_target. If this is reached before recovery_target is met,
+    // growth stops with SaturationReason::WorkingMemoryCeiling.
+    size_t max_work_memory = std::numeric_limits<size_t>::max();
+
     // Derived: one full-width orbital mask per fragment (bit set at every
     // orbital in fragment_blocks[f]), computed by validate_and_prepare_sector_
     // constraint. classify_determinant_t / screen_candidate_t require
     // `prepared == true`.
     std::vector<StorageType> fragment_mask;
     bool prepared = false;
+};
+
+// Why pool_build_t's growth stopped without reaching recovery_target. Only
+// meaningful when FilteredGrowthResult::recovery_target_met is false --
+// deliberately does NOT include a "doorway limit" value: reaching the doorway
+// limit alone never stops growth (R must still be able to enter), so it is
+// reported as a separate FilteredGrowthResult::doorway_limit_reached flag
+// instead of a mutually-exclusive terminal reason.
+enum class SaturationReason : int {
+    None = 0,
+    FrontierExhausted = 1,
+    ThresholdFloor = 2,
+    RoundLimit = 3,
+    WorkingMemoryCeiling = 4,
+};
+
+// Unique pool composition (Milestone C2b-1) -- NOT the same thing as
+// ScreeningTelemetry's event counts above. A determinant counts here exactly
+// once, when pool_map.try_emplace (or initial-pool seeding) actually inserts
+// it; ScreeningTelemetry can and often will show more events than these
+// counts show insertions.
+struct FilteredGrowthResult {
+    uint64_t n_protected = 0;  // unique P_K members
+    uint64_t n_recovery = 0;   // unique dispersion + ct_allowed members (R)
+    uint64_t n_aux = 0;        // unique admitted las_absent doorway members (O)
+    uint64_t n_work = 0;       // unique total pool members (P_K + R + O)
+    bool recovery_target_met = false;
+    bool doorway_limit_reached = false;
+    SaturationReason saturation_reason = SaturationReason::None;
 };
 
 // Cross-checks every field for internal consistency and precomputes
@@ -132,11 +184,29 @@ struct SectorConstraint {
 //   - a fragment_support entry with bits outside its own block, or whose
 //     occupation does not match that fragment's own reference sector;
 //   - a protected determinant that is not LAS-present (i.e. not composed
-//     entirely of fragment-local determinants already in fragment_support).
+//     entirely of fragment-local determinants already in fragment_support);
+//   - (Milestone C2b-1) recovery_target > 0 (filtered-growth policy active)
+//     with max_work_memory < protected_determinants.size() + recovery_target
+//     -- the working capacity cannot possibly hold P_K plus the requested
+//     recovery population, so this fails at configuration time rather than
+//     after a doomed growth run.
 // Must be called exactly once before classify_determinant_t / screen_candidate_t
 // are used on a given constraint; sets constraint.prepared = true on success.
 template<typename StorageType>
 void validate_and_prepare_sector_constraint(SectorConstraint<StorageType>& constraint, int n_orb);
+
+// Milestone C2b-1: classifies every member of a caller-supplied initial pool
+// exactly once (as if heat_bath_passed=true -- seeds are not subject to
+// heat-bath admission) and returns a label per determinant, in input order.
+// Throws std::invalid_argument if any NON-protected member classifies as
+// LasPresent or CtDisallowed: an initial pool is not itself subject to the
+// candidate-generation admission rule, but it must not silently contain
+// determinants that rule would never have produced. Requires
+// constraint.prepared.
+template<typename StorageType>
+std::vector<SectorLabel> classify_initial_pool_t(
+    const std::vector<DeterminantT<StorageType>>& initial_pool,
+    const SectorConstraint<StorageType>& constraint);
 
 // Classify one candidate determinant and decide admission, per
 // docs/methods/filter-aware-phased-trimci-interfragment-recovery.md sec 3.3's

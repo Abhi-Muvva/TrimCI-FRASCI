@@ -170,7 +170,11 @@ pool_build_t(
     // Nullable telemetry sink. When sector_constraint is provided but this is
     // null, counters are still accumulated internally (cheap) but discarded --
     // callers that need them must pass a non-null pointer.
-    ScreeningTelemetry* telemetry_out = nullptr
+    ScreeningTelemetry* telemetry_out = nullptr,
+    // Milestone C2b-1: nullable unique-composition result sink. Only written
+    // when sector_constraint->recovery_target > 0 (filtered growth active);
+    // untouched (left at whatever the caller default-constructed) otherwise.
+    FilteredGrowthResult* filtered_result_out = nullptr
 );
 
 // Wrapper for backward compatibility

@@ -8,6 +8,7 @@
 // untouched; these are new, separate bindings.
 #include "bind_common.hpp"
 
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -32,6 +33,29 @@ const char* label_name(SectorLabel label) {
     return "";
 }
 
+const char* saturation_reason_name(SaturationReason reason) {
+    switch (reason) {
+        case SaturationReason::None:               return "none";
+        case SaturationReason::FrontierExhausted:  return "frontier_exhausted";
+        case SaturationReason::ThresholdFloor:     return "threshold_floor";
+        case SaturationReason::RoundLimit:         return "round_limit";
+        case SaturationReason::WorkingMemoryCeiling: return "working_memory_ceiling";
+    }
+    return "";
+}
+
+py::dict filtered_result_to_dict(const FilteredGrowthResult& r) {
+    py::dict out;
+    out["n_protected"] = r.n_protected;
+    out["n_recovery"] = r.n_recovery;
+    out["n_aux"] = r.n_aux;
+    out["n_work"] = r.n_work;
+    out["recovery_target_met"] = r.recovery_target_met;
+    out["doorway_limit_reached"] = r.doorway_limit_reached;
+    out["saturation_reason"] = std::string(saturation_reason_name(r.saturation_reason));
+    return out;
+}
+
 // Builds a SectorConstraint from plain Python-facing arguments and validates
 // it -- the same "assemble a config struct from plain args inside the binding"
 // convention this codebase already uses for PoolBuildParams (bind_trimci.cpp's
@@ -44,7 +68,13 @@ SectorConstraint<StorageType> build_and_validate_constraint(
     const std::vector<std::vector<DeterminantT<StorageType>>>& fragment_support,
     const std::vector<DeterminantT<StorageType>>& protected_determinants,
     int n_ct_max,
-    bool allow_las_absent_owned)
+    bool allow_las_absent_owned,
+    // Milestone C2b-1 filtered-growth policy (0/max = off, matching
+    // SectorConstraint's own field defaults). Irrelevant to plain
+    // classify_determinant_* callers, which never set these.
+    size_t recovery_target = 0,
+    size_t doorway_limit = std::numeric_limits<size_t>::max(),
+    size_t max_work_memory = std::numeric_limits<size_t>::max())
 {
     const size_t n_frag = fragment_blocks.size();
     if (reference_sectors.size() != n_frag || fragment_support.size() != n_frag) {
@@ -57,6 +87,9 @@ SectorConstraint<StorageType> build_and_validate_constraint(
     constraint.fragment_blocks = fragment_blocks;
     constraint.n_ct_max = n_ct_max;
     constraint.allow_las_absent_owned = allow_las_absent_owned;
+    constraint.recovery_target = recovery_target;
+    constraint.doorway_limit = doorway_limit;
+    constraint.max_work_memory = max_work_memory;
 
     constraint.reference_alpha.resize(n_frag);
     constraint.reference_beta.resize(n_frag);
@@ -115,11 +148,18 @@ py::dict telemetry_to_dict(const ScreeningTelemetry& t) {
     return out;
 }
 
-// Exercises the actual C2a pool_build_t integration (not just the standalone
+// Exercises the actual pool_build_t integration (not just the standalone
 // classifier): builds a SectorConstraint from plain args, then calls
-// pool_build_t<StorageType> with it, returning (pool, threshold, telemetry).
+// pool_build_t<StorageType> with it, returning
+// (pool, threshold, telemetry_dict, filtered_result_dict).
 // `sector_constraint_enabled=False` calls pool_build_t with a null constraint
 // pointer -- the exact disabled path production code takes today.
+// `recovery_target=0` (the default) keeps C2a's classic pool_map.size()
+// stopping even with the constraint active for filtering; `recovery_target>0`
+// is Milestone C2b-1's explicit filtered-growth opt-in, at which point
+// filtered_result_dict is populated (a pre-C2b-1 caller sees an all-zero dict
+// with saturation_reason="none" -- harmless, since it never checks these
+// fields when it never asked for filtered growth).
 template<typename StorageType>
 py::tuple pool_build_with_sector_constraint_impl(
     const std::vector<DeterminantT<StorageType>>& initial_pool,
@@ -141,28 +181,36 @@ py::tuple pool_build_with_sector_constraint_impl(
     const std::vector<std::vector<DeterminantT<StorageType>>>& fragment_support,
     const std::vector<DeterminantT<StorageType>>& protected_determinants,
     int n_ct_max,
-    bool allow_las_absent_owned)
+    bool allow_las_absent_owned,
+    size_t recovery_target,
+    size_t doorway_limit,
+    size_t max_work_memory,
+    bool strict_target_size)
 {
     PoolBuildParams params;
     params.max_rounds = max_rounds;
     params.threshold_decay = threshold_decay;
+    params.strict_target_size = strict_target_size;
 
     SectorConstraint<StorageType> constraint;
     const SectorConstraint<StorageType>* constraint_ptr = nullptr;
     if (sector_constraint_enabled) {
         constraint = build_and_validate_constraint<StorageType>(
             n_orb, fragment_blocks, reference_sectors, fragment_support,
-            protected_determinants, n_ct_max, allow_las_absent_owned);
+            protected_determinants, n_ct_max, allow_las_absent_owned,
+            recovery_target, doorway_limit, max_work_memory);
         constraint_ptr = &constraint;
     }
 
     ScreeningTelemetry telemetry;
+    FilteredGrowthResult filtered_result;
     auto result = pool_build_t<StorageType>(
         initial_pool, initial_coeff, n_orb, h1, eri, threshold, target_size,
         cache, cache_file, attentive_orbitals, verbosity, params,
-        nullptr, nullptr, constraint_ptr, &telemetry);
+        nullptr, nullptr, constraint_ptr, &telemetry, &filtered_result);
 
-    return py::make_tuple(result.first, result.second, telemetry_to_dict(telemetry));
+    return py::make_tuple(result.first, result.second, telemetry_to_dict(telemetry),
+                          filtered_result_to_dict(filtered_result));
 }
 
 template<size_t N>
@@ -186,7 +234,11 @@ void bind_scalable_sector_constraint(py::module& m, const std::string& suffix) {
           py::arg("reference_sectors") = std::vector<std::pair<int, int>>{},
           py::arg("fragment_support") = std::vector<std::vector<DeterminantT<StorageType>>>{},
           py::arg("protected_determinants") = std::vector<DeterminantT<StorageType>>{},
-          py::arg("n_ct_max") = 2, py::arg("allow_las_absent_owned") = false);
+          py::arg("n_ct_max") = 2, py::arg("allow_las_absent_owned") = false,
+          py::arg("recovery_target") = size_t(0),
+          py::arg("doorway_limit") = std::numeric_limits<size_t>::max(),
+          py::arg("max_work_memory") = std::numeric_limits<size_t>::max(),
+          py::arg("strict_target_size") = false);
 }
 
 } // namespace
@@ -209,7 +261,11 @@ void bind_sector_constraint(py::module& m) {
           py::arg("reference_sectors") = std::vector<std::pair<int, int>>{},
           py::arg("fragment_support") = std::vector<std::vector<DeterminantT<uint64_t>>>{},
           py::arg("protected_determinants") = std::vector<DeterminantT<uint64_t>>{},
-          py::arg("n_ct_max") = 2, py::arg("allow_las_absent_owned") = false);
+          py::arg("n_ct_max") = 2, py::arg("allow_las_absent_owned") = false,
+          py::arg("recovery_target") = size_t(0),
+          py::arg("doorway_limit") = std::numeric_limits<size_t>::max(),
+          py::arg("max_work_memory") = std::numeric_limits<size_t>::max(),
+          py::arg("strict_target_size") = false);
 
     bind_scalable_sector_constraint<2>(m, "128");
     bind_scalable_sector_constraint<3>(m, "192");
