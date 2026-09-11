@@ -8,6 +8,7 @@
 
 #include <vector>
 #include <cstddef>
+#include <memory>
 #include <string>
 #include <optional>
 
@@ -15,6 +16,7 @@
 #include "detspace_davidson.hpp"
 #include "streaming_pt2.hpp"
 #include "dressed_ci.hpp"
+#include "sector_constraint.hpp"
 
 namespace trimci_core {
 namespace fe {
@@ -119,6 +121,22 @@ struct ExpansionConfig {
 
     int checkpoint_round_offset = 0;  // added to internal round counter for checkpoint filenames
 
+    // Milestone C2b-2: filtered interfragment recovery (Phase 1 / Phase 2).
+    // Typed and shared-owning, not a raw pointer: the phase configs outlive
+    // the native call and the constraint is large, so every phase in a
+    // run_expansion_phased stream shares ONE immutable instance with no copy
+    // per phase, per round, or per iteration. Null (the default) is the
+    // original unfiltered expansion exactly.
+    std::shared_ptr<SectorConstraint<StorageType>> sector_constraint;
+    // Per-phase knobs. recovery.recovery_target > 0 replaces this phase's
+    // total-determinant stopping with "grow until this many unique R
+    // determinants are present", so Phase 1 and Phase 2 can request different
+    // targets from the one shared constraint above.
+    RecoveryPolicy recovery;
+    // Phase number recorded in telemetry (run_expansion_phased sets it per
+    // phase; a standalone run_expansion call may set it itself).
+    int phase_index = 1;
+
     // Output
     int verbose = 1;
     std::string log_file;  // if non-empty, tee all output to this file (real-time flush)
@@ -144,6 +162,13 @@ struct ExpansionResult {
     std::vector<double> U_total;                     // n_orb × n_orb, row-major
     std::vector<std::vector<double>> h1_optimized;   // [n_orb][n_orb]
     std::vector<double> eri_optimized;               // n_orb^4 flat
+
+    // Milestone C2b-2. Empty/default unless a sector constraint with
+    // recovery.recovery_target > 0 was configured, so unfiltered expansions
+    // are bit-for-bit unchanged in every field above.
+    FilteredWorkflowTelemetry filtered_telemetry;
+    FilteredGrowthResult filtered_composition;  // of dets, by reclassification
+    std::string termination_reason;
 };
 
 template<typename StorageType>

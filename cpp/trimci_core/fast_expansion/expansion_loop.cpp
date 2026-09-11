@@ -427,6 +427,27 @@ ExpansionResult<StorageType> run_expansion(
     result.dets = initial_dets;
     result.coefficients = initial_coeffs;
 
+    // ========================================================================
+    // Milestone C2b-2: filtered interfragment recovery
+    // ========================================================================
+    const SectorConstraint<StorageType>* constraint = config.sector_constraint.get();
+    const bool filtered = constraint && config.recovery.recovery_target > 0;
+    if (constraint && !constraint->prepared) {
+        throw std::invalid_argument(
+            "run_expansion: sector_constraint must be validated by "
+            "validate_and_prepare_sector_constraint before use");
+    }
+    if (filtered) {
+        validate_recovery_policy(config.recovery, constraint->protected_determinants.size(),
+                                 "run_expansion (phase " + std::to_string(config.phase_index) + ")");
+        // Incoming state -- a phase handoff, a warm start, or a loaded file --
+        // is reclassified and validated, never silently accepted. Throws if a
+        // forbidden determinant arrived or if any P_K member went missing.
+        result.filtered_composition = compose_and_validate_t(
+            initial_dets, *constraint, config.recovery.recovery_target,
+            "run_expansion (phase " + std::to_string(config.phase_index) + ") input state");
+    }
+
     if (config.verbose >= 1) {
         std::cout << "\n"
             << "============================================================\n"
@@ -481,6 +502,8 @@ ExpansionResult<StorageType> run_expansion(
         std::vector<DeterminantT<StorageType>> new_dets;
         double final_threshold = threshold;
         bool space_converged = false;
+        ScreeningTelemetry round_events;
+        FilteredGrowthResult round_pool_composition;
 
         if (config.evaluate_only) {
             // Skip expansion: run Davidson+PT2+dressed on existing dets
@@ -510,6 +533,7 @@ ExpansionResult<StorageType> run_expansion(
             pb_params.threshold_decay = config.threshold_decay;
             pb_params.strict_target_size = config.strict_target_size;
             pb_params.e0 = prev_energy;
+            pb_params.recovery = config.recovery;
 
             // Compute MI weights for "mi" screening mode
             if (config.screening_mode == "mi") {
@@ -561,7 +585,12 @@ ExpansionResult<StorageType> run_expansion(
                 cache, cache_file,
                 /*attentive_orbitals=*/{},
                 /*verbosity=*/config.verbose,
-                pb_params);
+                pb_params,
+                /*precomputed_sparsity=*/nullptr,
+                /*precomputed_table=*/nullptr,
+                constraint,
+                constraint ? &round_events : nullptr,
+                filtered ? &round_pool_composition : nullptr);
             new_dets = std::move(expanded_dets);
             final_threshold = ft;
 
@@ -1274,12 +1303,53 @@ ExpansionResult<StorageType> run_expansion(
         // ==================================================================
         bool energy_converged = (round > 0) &&
             (std::abs(energy - prev_energy) < config.expansion_energy_tol);
-        bool size_limit = (dets.size() >= config.max_n_dets);
+        // In filtered mode this phase's target is the current unique
+        // N_recovery, never the total determinant count -- max_n_dets is not
+        // consulted, and config.recovery.max_work_dets is the resource ceiling
+        // instead (pool_build_t enforces it and reports WorkingMemoryCeiling).
+        bool size_limit = !filtered && (dets.size() >= config.max_n_dets);
+
+        if (filtered) {
+            FilteredStageTelemetry stage;
+            stage.phase = config.phase_index;
+            stage.index = round;
+            stage.events = round_events;
+            stage.pool = round_pool_composition;
+            // Reclassified from the determinants this round actually ended
+            // with -- the authoritative count, not a carried-forward counter.
+            stage.state = compose_and_validate_t(
+                dets, *constraint, config.recovery.recovery_target,
+                "run_expansion (phase " + std::to_string(config.phase_index)
+                    + ") round " + std::to_string(round) + " state");
+            stage.requested_recovery_target = config.recovery.recovery_target;
+            stage.target_met = stage.state.recovery_target_met;
+            result.filtered_telemetry.stages.push_back(stage);
+
+            if (config.verbose >= 1) {
+                std::cout << "[FE Round " << round << "] Filtered: N_protected="
+                    << stage.state.n_protected << ", N_recovery=" << stage.state.n_recovery
+                    << "/" << config.recovery.recovery_target << ", N_aux=" << stage.state.n_aux
+                    << ", N_work=" << stage.state.n_work << std::endl;
+            }
+            if (stage.target_met) {
+                result.termination_reason = "recovery_target_met";
+            } else if (stage.pool.saturation_reason == SaturationReason::WorkingMemoryCeiling) {
+                result.termination_reason = "work_limit";
+            }
+            if (!result.termination_reason.empty()) {
+                if (config.verbose >= 1) {
+                    std::cout << "[FE] Filtered stop: " << result.termination_reason << std::endl;
+                }
+                prev_energy = energy;
+                break;
+            }
+        }
 
         if (config.evaluate_only) {
             if (config.verbose >= 1) {
                 std::cout << "[FE] Evaluate-only: done after 1 round." << std::endl;
             }
+            result.termination_reason = "evaluate_only";
             prev_energy = energy;
             break;
         }
@@ -1290,6 +1360,7 @@ ExpansionResult<StorageType> run_expansion(
                     << std::abs(energy - prev_energy)
                     << " < " << config.expansion_energy_tol << std::endl;
             }
+            result.termination_reason = "energy_converged";
             prev_energy = energy;
             break;
         }
@@ -1297,6 +1368,7 @@ ExpansionResult<StorageType> run_expansion(
             if (config.verbose >= 1) {
                 std::cout << "[FE] Space converged, no more dets to add." << std::endl;
             }
+            result.termination_reason = "space_converged";
             prev_energy = energy;
             break;
         }
@@ -1305,6 +1377,7 @@ ExpansionResult<StorageType> run_expansion(
                 std::cout << "[FE] Size limit reached: " << dets.size()
                     << " >= " << config.max_n_dets << std::endl;
             }
+            result.termination_reason = "size_limit";
             prev_energy = energy;
             break;
         }
@@ -1324,6 +1397,21 @@ ExpansionResult<StorageType> run_expansion(
     result.U_total = std::move(U_total);
     result.h1_optimized = std::move(h1_work);
     result.eri_optimized = std::move(eri_work);
+
+    if (filtered) {
+        if (result.termination_reason.empty()) result.termination_reason = "round_limit";
+        // Final state of the phase, separated into P_K / R / O by
+        // reclassification. Orbital optimization above rotated the integrals
+        // but never changed determinant membership, so the same labels apply;
+        // this is a SEARCH-label composition, not a certificate about the
+        // physical LAS frame (that is a later milestone).
+        result.filtered_composition = compose_and_validate_t(
+            result.dets, *constraint, config.recovery.recovery_target,
+            "run_expansion (phase " + std::to_string(config.phase_index) + ") final state");
+        if (!result.filtered_telemetry.stages.empty()) {
+            result.filtered_telemetry.stages.back().termination_reason = result.termination_reason;
+        }
+    }
 
     double t_wall = std::chrono::duration<double>(Clock::now() - t_total).count();
 
@@ -1369,11 +1457,18 @@ ExpansionResult<StorageType> run_expansion_phased(
         auto result = run_expansion(dets, coeffs, h1_work, eri_work,
                                     n_orb, phase_configs[p]);
 
-        // Transfer state for next phase
+        // Transfer state for next phase. run_expansion revalidates whatever
+        // it is handed against the next phase's own constraint on entry, so a
+        // forbidden determinant or a lost P_K member cannot cross a handoff
+        // silently. dets and coefficients move together as one indexed pair,
+        // so amplitudes stay attached to their determinant identities.
         dets = std::move(result.dets);
         coeffs = std::move(result.coefficients);
         h1_work = std::move(result.h1_optimized);
         eri_work = std::move(result.eri_optimized);
+        combined.filtered_telemetry.merge(result.filtered_telemetry);
+        combined.filtered_composition = result.filtered_composition;
+        combined.termination_reason = result.termination_reason;
 
         // Accumulate U_total = U_total_old × U_phase
         if (!result.U_total.empty()) {
@@ -1404,6 +1499,16 @@ ExpansionResult<StorageType> run_expansion_phased(
     combined.U_total = std::move(U_total);
     combined.h1_optimized = std::move(h1_work);
     combined.eri_optimized = std::move(eri_work);
+    if (!phase_configs.empty() && phase_configs.back().sector_constraint
+        && phase_configs.back().recovery.recovery_target > 0) {
+        // One last independent reclassification of what the whole stream
+        // returns, so the caller's P_K / R / O split is derived from the
+        // determinants themselves rather than from any carried counter.
+        combined.filtered_composition = compose_and_validate_t(
+            combined.dets, *phase_configs.back().sector_constraint,
+            phase_configs.back().recovery.recovery_target,
+            "run_expansion_phased final state");
+    }
     return combined;
 }
 

@@ -455,11 +455,11 @@ pool_build_t(
     ScreeningTelemetry aggregate_telemetry;
 
     // Milestone C2b-1: filtered-growth policy is an explicit opt-in
-    // (sector_constraint->recovery_target > 0). A constraint can be active
+    // (params.recovery.recovery_target > 0). A constraint can be active
     // purely for candidate filtering (C2a) while pool_build_t still uses
     // classic pool_map.size() stopping -- this flag, not sector_constraint
     // alone, is what switches the stopping/truncation/accounting behavior.
-    const bool filtered_growth_active = sector_constraint && sector_constraint->recovery_target > 0;
+    const bool filtered_growth_active = sector_constraint && params.recovery.recovery_target > 0;
     FilteredGrowthResult filtered_result;
     fe::fe_map<DeterminantT<StorageType>, SectorLabel, fe::DetHash<StorageType>> pool_labels;
     if (filtered_growth_active) {
@@ -485,17 +485,17 @@ pool_build_t(
     auto growth_metric = [&]() -> size_t {
         return filtered_growth_active ? static_cast<size_t>(filtered_result.n_recovery) : pool_map.size();
     };
-    const size_t growth_target = filtered_growth_active ? sector_constraint->recovery_target : target_size;
+    const size_t growth_target = filtered_growth_active ? params.recovery.recovery_target : target_size;
 
     // Shared by all three insertion sites (heat_bath merge, PT2 aggregation,
     // PT2 heat_bath_pt2) so the doorway/work-memory/composition rules are
     // defined exactly once, not per candidate-buffer shape.
     auto filtered_insertion_blocked = [&](SectorLabel label) -> bool {
         if (!filtered_growth_active) return false;
-        return label == SectorLabel::LasAbsent && filtered_result.n_aux >= sector_constraint->doorway_limit;
+        return label == SectorLabel::LasAbsent && filtered_result.n_aux >= params.recovery.doorway_limit;
     };
     auto filtered_work_memory_full = [&]() -> bool {
-        return filtered_growth_active && filtered_result.n_work >= sector_constraint->max_work_memory;
+        return filtered_growth_active && filtered_result.n_work >= params.recovery.max_work_dets;
     };
     auto account_filtered_insertion = [&](const DeterminantT<StorageType>& det, SectorLabel label) {
         pool_labels[det] = label;
@@ -505,7 +505,7 @@ pool_build_t(
             case SectorLabel::CtAllowed: filtered_result.n_recovery++; break;
             case SectorLabel::LasAbsent:
                 filtered_result.n_aux++;
-                if (filtered_result.n_aux >= sector_constraint->doorway_limit) {
+                if (filtered_result.n_aux >= params.recovery.doorway_limit) {
                     filtered_result.doorway_limit_reached = true;
                 }
                 break;
@@ -858,8 +858,8 @@ pool_build_t(
                 }
                 if (work_memory_capped) {
                     if (verbosity >= 1) {
-                        std::cout << "[PoolBuild] max_work_memory reached ("
-                                  << sector_constraint->max_work_memory << "), stopping merge." << std::endl;
+                        std::cout << "[PoolBuild] max_work_dets reached ("
+                                  << params.recovery.max_work_dets << "), stopping merge." << std::endl;
                     }
                     filtered_result.saturation_reason = SaturationReason::WorkingMemoryCeiling;
                     filtered_saturated = true;
@@ -1169,13 +1169,13 @@ pool_build_t(
             return score_of(a) > score_of(b);
         };
         std::sort(kept_recovery.begin(), kept_recovery.end(), by_score_desc);
-        if (kept_recovery.size() > sector_constraint->recovery_target) {
-            kept_recovery.resize(sector_constraint->recovery_target);
+        if (kept_recovery.size() > params.recovery.recovery_target) {
+            kept_recovery.resize(params.recovery.recovery_target);
         }
         std::sort(kept_aux.begin(), kept_aux.end(), by_score_desc);
-        if (sector_constraint->doorway_limit != std::numeric_limits<size_t>::max()
-            && kept_aux.size() > sector_constraint->doorway_limit) {
-            kept_aux.resize(sector_constraint->doorway_limit);
+        if (params.recovery.doorway_limit != std::numeric_limits<size_t>::max()
+            && kept_aux.size() > params.recovery.doorway_limit) {
+            kept_aux.resize(params.recovery.doorway_limit);
         }
         if (verbosity >= 1) {
             std::cout << "[PoolBuild] Filtered strict truncation: P_K=" << kept_protected.size()
@@ -1268,7 +1268,7 @@ pool_build_t(
             }
         }
         recomputed.n_work = final_pool.size();
-        recomputed.recovery_target_met = recomputed.n_recovery >= sector_constraint->recovery_target;
+        recomputed.recovery_target_met = recomputed.n_recovery >= params.recovery.recovery_target;
         recomputed.doorway_limit_reached = filtered_result.doorway_limit_reached;
         *filtered_result_out = recomputed;
     }

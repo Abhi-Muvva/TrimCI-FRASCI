@@ -134,19 +134,20 @@ void validate_and_prepare_sector_constraint(SectorConstraint<StorageType>& const
         }
     }
 
-    // Milestone C2b-1: fail early if the filtered-growth policy is internally
-    // impossible, rather than after a doomed growth run.
-    if (constraint.recovery_target > 0) {
-        const size_t required = constraint.protected_determinants.size() + constraint.recovery_target;
-        if (constraint.max_work_memory < required) {
-            throw std::invalid_argument(
-                "SectorConstraint: max_work_memory (" + std::to_string(constraint.max_work_memory)
-                + ") cannot hold P_K (" + std::to_string(constraint.protected_determinants.size())
-                + ") plus the requested recovery_target (" + std::to_string(constraint.recovery_target) + ")");
-        }
-    }
-
     constraint.prepared = true;
+}
+
+void validate_recovery_policy(const RecoveryPolicy& policy, size_t n_protected,
+                              const std::string& context) {
+    if (policy.recovery_target == 0) return;
+    const size_t required = n_protected + policy.recovery_target;
+    if (policy.max_work_dets < required) {
+        throw std::invalid_argument(
+            context + ": max_work_dets (" + std::to_string(policy.max_work_dets)
+            + ") cannot hold P_K (" + std::to_string(n_protected)
+            + ") plus the requested recovery_target ("
+            + std::to_string(policy.recovery_target) + ")");
+    }
 }
 
 template<typename StorageType>
@@ -168,6 +169,56 @@ std::vector<SectorLabel> classify_initial_pool_t(
         labels.push_back(result.label);
     }
     return labels;
+}
+
+template<typename StorageType>
+FilteredGrowthResult compose_and_validate_t(
+    const std::vector<DeterminantT<StorageType>>& dets,
+    const SectorConstraint<StorageType>& constraint,
+    size_t recovery_target,
+    const std::string& context)
+{
+    FilteredGrowthResult out;
+    std::unordered_set<DeterminantT<StorageType>> seen_protected;
+    for (const auto& det : dets) {
+        SectorClassification r = classify_determinant_t(det, constraint, /*heat_bath_passed=*/true);
+        switch (r.label) {
+            case SectorLabel::Protected:
+                out.n_protected++;
+                seen_protected.insert(det);
+                break;
+            case SectorLabel::Dispersion:
+            case SectorLabel::CtAllowed:
+                out.n_recovery++;
+                break;
+            case SectorLabel::LasAbsent:
+                if (!constraint.allow_las_absent_owned) {
+                    throw std::invalid_argument(
+                        context + ": determinant set contains a LAS-absent (doorway) determinant "
+                        "while allow_las_absent_owned is false");
+                }
+                out.n_aux++;
+                break;
+            case SectorLabel::LasPresent:
+                throw std::invalid_argument(
+                    context + ": determinant set contains a LAS-present determinant outside the "
+                    "protected seed -- the admission rule never produces one, so it cannot arrive "
+                    "through a warm start, a load, or a phase handoff");
+            case SectorLabel::CtDisallowed:
+                throw std::invalid_argument(
+                    context + ": determinant set contains a charge-transfer determinant of order "
+                    + std::to_string(r.n_ct) + " > n_ct_max");
+        }
+    }
+    if (seen_protected.size() != constraint.protected_determinants.size()) {
+        throw std::invalid_argument(
+            context + ": protected seed identity changed -- " + std::to_string(seen_protected.size())
+            + " of " + std::to_string(constraint.protected_determinants.size())
+            + " P_K determinants are present");
+    }
+    out.n_work = dets.size();
+    out.recovery_target_met = (recovery_target == 0) || (out.n_recovery >= recovery_target);
+    return out;
 }
 
 template<typename StorageType>
@@ -226,7 +277,10 @@ SectorClassification classify_determinant_t(
     template SectorClassification classify_determinant_t<__VA_ARGS__>(                     \
         const DeterminantT<__VA_ARGS__>&, const SectorConstraint<__VA_ARGS__>&, bool);     \
     template std::vector<SectorLabel> classify_initial_pool_t<__VA_ARGS__>(                \
-        const std::vector<DeterminantT<__VA_ARGS__>>&, const SectorConstraint<__VA_ARGS__>&);
+        const std::vector<DeterminantT<__VA_ARGS__>>&, const SectorConstraint<__VA_ARGS__>&); \
+    template FilteredGrowthResult compose_and_validate_t<__VA_ARGS__>(                     \
+        const std::vector<DeterminantT<__VA_ARGS__>>&, const SectorConstraint<__VA_ARGS__>&, \
+        size_t, const std::string&);
 
 TRIMCI_INSTANTIATE_SECTOR_CONSTRAINT(uint64_t)
 TRIMCI_INSTANTIATE_SECTOR_CONSTRAINT(std::array<uint64_t, 2>)

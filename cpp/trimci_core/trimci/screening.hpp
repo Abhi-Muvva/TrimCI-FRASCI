@@ -54,6 +54,14 @@ struct PoolBuildParams {
     // Candidates from high-weight parents (merged first) are kept.
     // 0 = no limit (default).
     int max_pool_size = 0;
+
+    // Milestone C2b-2: per-call filtered-growth policy. Only consulted when
+    // pool_build_t also receives a non-null SectorConstraint; the default
+    // (recovery_target == 0) is exactly the classic pool_map.size() stopping
+    // behavior, so every existing caller is unaffected. Lives here rather than
+    // on SectorConstraint so Phase 0, Phase 1, and Phase 2 can each request a
+    // different recovery target while sharing one immutable constraint.
+    RecoveryPolicy recovery;
 };
 
 // Screening mode (string-based for extensibility)

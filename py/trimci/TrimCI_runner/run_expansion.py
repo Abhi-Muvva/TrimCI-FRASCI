@@ -208,6 +208,24 @@ def _build_config(phase_dict, checkpoint_dir, use_128=False):
         "pt2":      dict  → PT2Config overrides (used when pt2_correction=True)
         use_128: bool     → use ExpansionConfig128 for n_orb > 64
     """
+    # Milestone C2b-2: the filter-aware recovery constraint is a native handle
+    # (trimci_core.SectorConstraint*), not a JSON-serializable value, so it
+    # cannot travel through this flat-dict phase configuration. Rather than
+    # dropping such a key silently -- which would look like a successful
+    # filtered run while actually growing unfiltered -- reject it and point at
+    # the supported in-memory route.
+    _recovery_keys = {"sector_constraint", "recovery", "recovery_target",
+                      "doorway_limit", "max_work_dets"}
+    _requested = _recovery_keys & set(phase_dict)
+    if _requested:
+        raise ValueError(
+            f"run_expansion phase config cannot carry filter-aware recovery settings "
+            f"{sorted(_requested)}: the sector constraint is a native handle. Build "
+            f"fe.ExpansionConfig()/ExpansionConfig128() directly and set "
+            f".sector_constraint / .recovery / .phase_index in memory, then call "
+            f"fe.run_expansion_phased(...)."
+        )
+
     merged = {**EXPANSION_DEFAULTS, **ORBOPT_DEFAULTS, **phase_dict}
     davidson_kw = {**DAVIDSON_DEFAULTS, **merged.pop("davidson", {})}
     pt2_overrides = merged.pop("pt2", {})

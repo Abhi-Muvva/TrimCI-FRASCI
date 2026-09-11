@@ -72,6 +72,18 @@ struct IterativeWorkflowParams {
     // --- Logging ---
     int verbosity = 1;  // 0=silent, 1=basic, 2=detailed
     
+    // --- Milestone C2b-2: filtered recovery (Phase 0) ---
+    // Only consulted when iterative_workflow_t also receives a non-null
+    // SectorConstraint. recovery.recovery_target > 0 replaces max_final_dets /
+    // total-core-size stopping with "grow until this many unique R
+    // determinants are present in the CURRENT core". The default (0) leaves
+    // every existing termination condition exactly as it was.
+    RecoveryPolicy recovery;
+    // Consecutive iterations with no increase in the current unique N_recovery
+    // before a filtered Phase 0 gives up and reports recovery_stagnant. Only
+    // used when recovery.recovery_target > 0.
+    int recovery_stagnation_limit = 3;
+
     // --- Saving ---
     int save_period = 1000000;       // Save every N iterations (default: effectively disabled)
     bool save_pool = false;          // Whether to save pool in periodic saves
@@ -119,6 +131,13 @@ struct IterativeWorkflowResult {
     int total_iterations = 0;
     bool success = true;
     std::string error_message;
+
+    // Milestone C2b-2. Empty/default unless a SectorConstraint with
+    // recovery.recovery_target > 0 was supplied, so unfiltered runs are
+    // bit-for-bit unchanged in every field above.
+    FilteredWorkflowTelemetry filtered_telemetry;
+    FilteredGrowthResult filtered_composition;  // of final_dets, by reclassification
+    std::string termination_reason;
 };
 
 // ============================================================================
@@ -146,7 +165,13 @@ IterativeWorkflowResult<BitType> iterative_workflow_t(
     const std::vector<DeterminantT<BitType>>& initial_dets,
     const std::vector<double>& initial_coeffs,
     double nuclear_repulsion,
-    const IterativeWorkflowParams& params
+    const IterativeWorkflowParams& params,
+    // Milestone C2b-2: typed, nullable, caller-owned sector constraint --
+    // never a bool+void* pair and never copied. The caller must keep it alive
+    // for the duration of this synchronous call (pybind holds the Python
+    // handle across the GIL release, so the object cannot dangle). nullptr,
+    // the default, is the original unfiltered Phase 0 exactly.
+    const SectorConstraint<BitType>* sector_constraint = nullptr
 );
 
 // Convenience alias for 64-bit determinants

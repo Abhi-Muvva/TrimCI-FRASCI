@@ -810,7 +810,8 @@ run_trim_t(
     int verbosity,
     const IntegralSparsityInfo* precomputed_sparsity,
     const std::vector<double>& core_coeffs,
-    const std::string& davidson_init
+    const std::string& davidson_init,
+    const std::unordered_set<DeterminantT<StorageType>>* protected_dets
 ) {
     if (verbosity >= 1) {
         std::cout << "[Trim] Start. Pool=" << params_initial_pool.size() << "\n";
@@ -836,11 +837,26 @@ run_trim_t(
     auto current_pool = params_initial_pool;
     auto core_dets = external_core_dets;
 
-    // Build core coefficient map for Davidson warm start
+    // Build core coefficient map for Davidson warm start.
+    // Built from external_core_dets/core_coeffs BEFORE P_K is merged in below,
+    // so appending protected determinants can never break the size==size
+    // precondition and silently disable the warm start.
     std::unordered_map<DeterminantT<StorageType>, double> core_coeff_map;
     if (!core_coeffs.empty() && core_coeffs.size() == core_dets.size()) {
         for (size_t i = 0; i < core_dets.size(); ++i) {
             core_coeff_map[core_dets[i]] = core_coeffs[i];
+        }
+    }
+
+    // Milestone C2b-2: force the immutable protected seed into the core, so it
+    // is present in every group subspace (core_dets is appended to each) and
+    // in the final selection (core_dets is appended unconditionally at the end
+    // of each round). Protected members absent from the warm-start core simply
+    // get guess coefficient 0 via make_initial_guess.
+    if (protected_dets && !protected_dets->empty()) {
+        std::unordered_set<DeterminantT<StorageType>> already(core_dets.begin(), core_dets.end());
+        for (const auto& d : *protected_dets) {
+            if (already.insert(d).second) core_dets.push_back(d);
         }
     }
 
@@ -1049,17 +1065,20 @@ template std::tuple<double, std::vector<DeterminantT<uint64_t>>, std::vector<dou
 run_trim_t<uint64_t>(const std::vector<DeterminantT<uint64_t>>&, const std::vector<std::vector<double>>&,
                      const std::vector<double>&, const std::string&, int, int,
                      const std::vector<int>&, const std::vector<int>&, bool, bool,
-                     const std::vector<DeterminantT<uint64_t>>&, double, int, const IntegralSparsityInfo*, const std::vector<double>&, const std::string&);
+                     const std::vector<DeterminantT<uint64_t>>&, double, int, const IntegralSparsityInfo*, const std::vector<double>&, const std::string&,
+                     const std::unordered_set<DeterminantT<uint64_t>>*);
 template std::tuple<double, std::vector<DeterminantT<std::array<uint64_t, 2>>>, std::vector<double>>
 run_trim_t<std::array<uint64_t, 2>>(const std::vector<DeterminantT<std::array<uint64_t, 2>>>&, const std::vector<std::vector<double>>&,
                                     const std::vector<double>&, const std::string&, int, int,
                                     const std::vector<int>&, const std::vector<int>&, bool, bool,
-                                    const std::vector<DeterminantT<std::array<uint64_t, 2>>>&, double, int, const IntegralSparsityInfo*, const std::vector<double>&, const std::string&);
+                                    const std::vector<DeterminantT<std::array<uint64_t, 2>>>&, double, int, const IntegralSparsityInfo*, const std::vector<double>&, const std::string&,
+                     const std::unordered_set<DeterminantT<std::array<uint64_t, 2>>>*);
 template std::tuple<double, std::vector<DeterminantT<std::array<uint64_t, 3>>>, std::vector<double>>
 run_trim_t<std::array<uint64_t, 3>>(const std::vector<DeterminantT<std::array<uint64_t, 3>>>&, const std::vector<std::vector<double>>&,
                                     const std::vector<double>&, const std::string&, int, int,
                                     const std::vector<int>&, const std::vector<int>&, bool, bool,
-                                    const std::vector<DeterminantT<std::array<uint64_t, 3>>>&, double, int, const IntegralSparsityInfo*, const std::vector<double>&, const std::string&);
+                                    const std::vector<DeterminantT<std::array<uint64_t, 3>>>&, double, int, const IntegralSparsityInfo*, const std::vector<double>&, const std::string&,
+                     const std::unordered_set<DeterminantT<std::array<uint64_t, 3>>>*);
 
 template std::vector<std::vector<DeterminantT<std::array<uint64_t, 4>>>> partition_pool_t<std::array<uint64_t, 4>>(const std::vector<DeterminantT<std::array<uint64_t, 4>>>&, int);
 template std::vector<std::vector<DeterminantT<std::array<uint64_t, 5>>>> partition_pool_t<std::array<uint64_t, 5>>(const std::vector<DeterminantT<std::array<uint64_t, 5>>>&, int);
@@ -1099,27 +1118,32 @@ template std::tuple<double, std::vector<DeterminantT<std::array<uint64_t, 4>>>, 
 run_trim_t<std::array<uint64_t, 4>>(const std::vector<DeterminantT<std::array<uint64_t, 4>>>&, const std::vector<std::vector<double>>&,
                                     const std::vector<double>&, const std::string&, int, int,
                                     const std::vector<int>&, const std::vector<int>&, bool, bool,
-                                    const std::vector<DeterminantT<std::array<uint64_t, 4>>>&, double, int, const IntegralSparsityInfo*, const std::vector<double>&, const std::string&);
+                                    const std::vector<DeterminantT<std::array<uint64_t, 4>>>&, double, int, const IntegralSparsityInfo*, const std::vector<double>&, const std::string&,
+                     const std::unordered_set<DeterminantT<std::array<uint64_t, 4>>>*);
 template std::tuple<double, std::vector<DeterminantT<std::array<uint64_t, 5>>>, std::vector<double>>
 run_trim_t<std::array<uint64_t, 5>>(const std::vector<DeterminantT<std::array<uint64_t, 5>>>&, const std::vector<std::vector<double>>&,
                                     const std::vector<double>&, const std::string&, int, int,
                                     const std::vector<int>&, const std::vector<int>&, bool, bool,
-                                    const std::vector<DeterminantT<std::array<uint64_t, 5>>>&, double, int, const IntegralSparsityInfo*, const std::vector<double>&, const std::string&);
+                                    const std::vector<DeterminantT<std::array<uint64_t, 5>>>&, double, int, const IntegralSparsityInfo*, const std::vector<double>&, const std::string&,
+                     const std::unordered_set<DeterminantT<std::array<uint64_t, 5>>>*);
 template std::tuple<double, std::vector<DeterminantT<std::array<uint64_t, 6>>>, std::vector<double>>
 run_trim_t<std::array<uint64_t, 6>>(const std::vector<DeterminantT<std::array<uint64_t, 6>>>&, const std::vector<std::vector<double>>&,
                                     const std::vector<double>&, const std::string&, int, int,
                                     const std::vector<int>&, const std::vector<int>&, bool, bool,
-                                    const std::vector<DeterminantT<std::array<uint64_t, 6>>>&, double, int, const IntegralSparsityInfo*, const std::vector<double>&, const std::string&);
+                                    const std::vector<DeterminantT<std::array<uint64_t, 6>>>&, double, int, const IntegralSparsityInfo*, const std::vector<double>&, const std::string&,
+                     const std::unordered_set<DeterminantT<std::array<uint64_t, 6>>>*);
 template std::tuple<double, std::vector<DeterminantT<std::array<uint64_t, 7>>>, std::vector<double>>
 run_trim_t<std::array<uint64_t, 7>>(const std::vector<DeterminantT<std::array<uint64_t, 7>>>&, const std::vector<std::vector<double>>&,
                                     const std::vector<double>&, const std::string&, int, int,
                                     const std::vector<int>&, const std::vector<int>&, bool, bool,
-                                    const std::vector<DeterminantT<std::array<uint64_t, 7>>>&, double, int, const IntegralSparsityInfo*, const std::vector<double>&, const std::string&);
+                                    const std::vector<DeterminantT<std::array<uint64_t, 7>>>&, double, int, const IntegralSparsityInfo*, const std::vector<double>&, const std::string&,
+                     const std::unordered_set<DeterminantT<std::array<uint64_t, 7>>>*);
 template std::tuple<double, std::vector<DeterminantT<std::array<uint64_t, 8>>>, std::vector<double>>
 run_trim_t<std::array<uint64_t, 8>>(const std::vector<DeterminantT<std::array<uint64_t, 8>>>&, const std::vector<std::vector<double>>&,
                                     const std::vector<double>&, const std::string&, int, int,
                                     const std::vector<int>&, const std::vector<int>&, bool, bool,
-                                    const std::vector<DeterminantT<std::array<uint64_t, 8>>>&, double, int, const IntegralSparsityInfo*, const std::vector<double>&, const std::string&);
+                                    const std::vector<DeterminantT<std::array<uint64_t, 8>>>&, double, int, const IntegralSparsityInfo*, const std::vector<double>&, const std::string&,
+                     const std::unordered_set<DeterminantT<std::array<uint64_t, 8>>>*);
 
 // =================================================================================
 // 5) transform_integrals

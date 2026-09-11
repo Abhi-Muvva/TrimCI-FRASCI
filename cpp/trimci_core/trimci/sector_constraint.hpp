@@ -5,13 +5,14 @@
 // C1, C2a, C2b-1).
 //
 // C2a wired classification into pool_build_t's two direct candidate-generation
-// paths (screening.cpp). C2b-1 adds unique recovery-pool composition
+// paths (screening.cpp). C2b-1 added unique recovery-pool composition
 // (N_protected/N_recovery/N_aux/N_work), recovery-target stopping, a doorway
-// insertion limit, and category-aware strict truncation -- all still inside
-// direct pool_build_t only. Phase 0/1/2 orchestration (iterative_workflow.cpp,
-// fast_expansion/expansion_loop.cpp), ExpansionConfig, run_trim_t, and
-// protected-seed survival across TRIM/core reselection and phase handoffs are
-// all still untouched -- that is Milestone C2b-2.
+// insertion limit, and category-aware strict truncation, inside direct
+// pool_build_t only. C2b-2 carries the same constraint, the immutable
+// protected seed, recovery-only target accounting, and per-stage telemetry
+// through TrimCI's whole Phase 0 -> Phase 1 -> Phase 2 workflow
+// (iterative_workflow.cpp, trim.cpp, fast_expansion/expansion_loop.cpp) and
+// splits the per-phase knobs out into RecoveryPolicy.
 //
 // Mirrors frasci.recovery._state.classify_recovery() exactly (Python oracle,
 // LASSCF_TRIMCI_COO/frasci/recovery/_state.py) -- same six labels, same truth
@@ -22,6 +23,7 @@
 #include <limits>
 #include <unordered_map>
 #include <unordered_set>
+#include <string>
 #include <vector>
 
 #include "determinant.hpp"
@@ -118,14 +120,29 @@ struct SectorConstraint {
     int n_ct_max = 2;
     bool allow_las_absent_owned = false;
 
-    // Milestone C2b-1 filtered-growth policy. Explicit opt-in: recovery_target
-    // == 0 (the default) means "filtered growth stopping is not requested" --
-    // pool_build_t keeps its original pool_map.size()-based stopping even with
-    // this constraint active for classification/filtering (exactly C2a's
-    // behavior, still available and still tested). recovery_target > 0 is the
-    // named "filtered-pool policy" that switches pool_build_t to stop on
-    // unique N_recovery, apply the doorway_limit, enforce max_work_memory, and
-    // use category-aware strict truncation -- never on total pool size.
+    // Derived: one full-width orbital mask per fragment (bit set at every
+    // orbital in fragment_blocks[f]), computed by validate_and_prepare_sector_
+    // constraint. classify_determinant_t / screen_candidate_t require
+    // `prepared == true`.
+    std::vector<StorageType> fragment_mask;
+    bool prepared = false;
+};
+
+// Per-call / per-phase filtered-growth knobs (Milestone C2b-1, moved out of
+// SectorConstraint in C2b-2). Deliberately separate and non-templated: the
+// constraint above is the large immutable classification data, shared by
+// reference/shared_ptr across every phase and every iteration and never
+// copied, while THIS struct is tiny and is copied freely so Phase 0, Phase 1,
+// and Phase 2 can each request a different recovery target from one shared
+// constraint.
+struct RecoveryPolicy {
+    // Explicit opt-in: recovery_target == 0 (the default) means "filtered
+    // growth stopping is not requested" -- pool_build_t keeps its original
+    // pool_map.size()-based stopping even with a constraint active for
+    // classification/filtering (exactly C2a's behavior, still available and
+    // still tested). recovery_target > 0 switches pool_build_t to stop on
+    // unique N_recovery, apply doorway_limit, enforce max_work_dets, and use
+    // category-aware strict truncation -- never on total pool size.
     size_t recovery_target = 0;
     // Maximum unique admitted LAS-absent (doorway, O) pool members. Reaching
     // this blocks further doorway insertions but never blocks recovery (R) or
@@ -133,15 +150,10 @@ struct SectorConstraint {
     size_t doorway_limit = std::numeric_limits<size_t>::max();
     // Independent ceiling on unique total pool members (N_work), regardless of
     // recovery_target. If this is reached before recovery_target is met,
-    // growth stops with SaturationReason::WorkingMemoryCeiling.
-    size_t max_work_memory = std::numeric_limits<size_t>::max();
-
-    // Derived: one full-width orbital mask per fragment (bit set at every
-    // orbital in fragment_blocks[f]), computed by validate_and_prepare_sector_
-    // constraint. classify_determinant_t / screen_candidate_t require
-    // `prepared == true`.
-    std::vector<StorageType> fragment_mask;
-    bool prepared = false;
+    // growth stops with SaturationReason::WorkingMemoryCeiling. This is a
+    // DETERMINANT COUNT, not a byte count -- it is compared directly against
+    // pool_map.size() (renamed from C2b-1's misleading `max_work_memory`).
+    size_t max_work_dets = std::numeric_limits<size_t>::max();
 };
 
 // Why pool_build_t's growth stopped without reaching recovery_target. Only
@@ -173,6 +185,31 @@ struct FilteredGrowthResult {
     SaturationReason saturation_reason = SaturationReason::None;
 };
 
+// Milestone C2b-2: one record per Phase-0 iteration / Phase-1/2 round, so the
+// persistent Phase 0 -> 1 -> 2 stream can be audited end to end. `events`
+// (ScreeningTelemetry) counts candidate-generation EVENTS; `state` counts
+// UNIQUE determinants in the stage's actual output determinant set,
+// recomputed by reclassification -- the two are deliberately not the same
+// number and must not be conflated.
+struct FilteredStageTelemetry {
+    int phase = 0;   // 0 = Phase 0 (iterative_workflow), 1.. = expansion phase
+    int index = 0;   // Phase-0 iteration, or expansion round, within the phase
+    int restart = 0; // Phase-0 restart index (0 unless the caller runs an ensemble)
+    ScreeningTelemetry events;
+    FilteredGrowthResult pool;   // composition of the pool_build_t result
+    FilteredGrowthResult state;  // composition of the stage's OUTPUT det set
+    size_t requested_recovery_target = 0;
+    bool target_met = false;
+    std::string termination_reason;  // empty while the phase is still running
+};
+
+struct FilteredWorkflowTelemetry {
+    std::vector<FilteredStageTelemetry> stages;
+    void merge(const FilteredWorkflowTelemetry& other) {
+        stages.insert(stages.end(), other.stages.begin(), other.stages.end());
+    }
+};
+
 // Cross-checks every field for internal consistency and precomputes
 // fragment_mask. Throws std::invalid_argument (with a specific message) on the
 // first violation found:
@@ -184,16 +221,19 @@ struct FilteredGrowthResult {
 //   - a fragment_support entry with bits outside its own block, or whose
 //     occupation does not match that fragment's own reference sector;
 //   - a protected determinant that is not LAS-present (i.e. not composed
-//     entirely of fragment-local determinants already in fragment_support);
-//   - (Milestone C2b-1) recovery_target > 0 (filtered-growth policy active)
-//     with max_work_memory < protected_determinants.size() + recovery_target
-//     -- the working capacity cannot possibly hold P_K plus the requested
-//     recovery population, so this fails at configuration time rather than
-//     after a doomed growth run.
+//     entirely of fragment-local determinants already in fragment_support).
 // Must be called exactly once before classify_determinant_t / screen_candidate_t
 // are used on a given constraint; sets constraint.prepared = true on success.
 template<typename StorageType>
 void validate_and_prepare_sector_constraint(SectorConstraint<StorageType>& constraint, int n_orb);
+
+// Fails a filtered-growth policy that is internally impossible, rather than
+// after a doomed growth run: with recovery_target > 0 the working capacity
+// must be able to hold P_K plus the requested recovery population. Called
+// once per phase, since each phase may request its own recovery_target from
+// one shared constraint. `context` is prefixed to the error message.
+void validate_recovery_policy(const RecoveryPolicy& policy, size_t n_protected,
+                              const std::string& context);
 
 // Milestone C2b-1: classifies every member of a caller-supplied initial pool
 // exactly once (as if heat_bath_passed=true -- seeds are not subject to
@@ -207,6 +247,28 @@ template<typename StorageType>
 std::vector<SectorLabel> classify_initial_pool_t(
     const std::vector<DeterminantT<StorageType>>& initial_pool,
     const SectorConstraint<StorageType>& constraint);
+
+// Milestone C2b-2: the single authoritative "what is actually in this
+// determinant set?" routine, used at every phase boundary, after every TRIM /
+// core reselection, and to fill FilteredStageTelemetry::state. It
+// deliberately re-derives composition by reclassification instead of trusting
+// carried-forward counters.
+//
+// Validates, in this order, and throws std::invalid_argument naming `context`:
+//   - every member classifies as PROTECTED, LAS_ABSENT, DISPERSION, or
+//     CT_ALLOWED (i.e. LAS_PRESENT outside P_K and CT_DISALLOWED can never
+//     arrive through a warm start, a load, or a phase handoff -- inherited
+//     from classify_initial_pool_t);
+//   - LAS_ABSENT members are present only when allow_las_absent_owned is set;
+//   - every member of constraint.protected_determinants is present, so a lost
+//     protected determinant is a loud failure rather than a silent one.
+// `recovery_target` only sets FilteredGrowthResult::recovery_target_met.
+template<typename StorageType>
+FilteredGrowthResult compose_and_validate_t(
+    const std::vector<DeterminantT<StorageType>>& dets,
+    const SectorConstraint<StorageType>& constraint,
+    size_t recovery_target,
+    const std::string& context);
 
 // Classify one candidate determinant and decide admission, per
 // docs/methods/filter-aware-phased-trimci-interfragment-recovery.md sec 3.3's

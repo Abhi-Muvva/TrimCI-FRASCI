@@ -4,6 +4,7 @@
 #include <tuple>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include "determinant.hpp"
 #include "hamiltonian.hpp"
 #include <Eigen/Sparse>
@@ -137,7 +138,15 @@ run_trim_t(
     int verbosity = 1,  // 0=silent, 1=basic, 2=detailed
     const IntegralSparsityInfo* precomputed_sparsity = nullptr,
     const std::vector<double>& core_coeffs = {},
-    const std::string& davidson_init = "warm"
+    const std::string& davidson_init = "warm",
+    // Milestone C2b-2: the IMMUTABLE protected seed P_K, kept deliberately
+    // separate from external_core_dets (the mutable current/warm-start core).
+    // external_core_dets keeps its existing meaning and existing guarantees
+    // unchanged; this set is additionally forced into every TRIM group
+    // subspace and into the final selection, so P_K survives even when the
+    // caller's current core has moved off it. nullptr (the default) is the
+    // original behavior exactly -- no existing caller is affected.
+    const std::unordered_set<DeterminantT<StorageType>>* protected_dets = nullptr
 );
 
 // Wrapper

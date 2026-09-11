@@ -10,6 +10,9 @@
 #include <filesystem>
 #include <sstream>
 #include <climits>
+#include <stdexcept>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace trimci_core {
 
@@ -58,15 +61,31 @@ IterativeWorkflowResult<BitType> iterative_workflow_t(
     const std::vector<DeterminantT<BitType>>& initial_dets,
     const std::vector<double>& initial_coeffs,
     double nuclear_repulsion,
-    const IterativeWorkflowParams& params
+    const IterativeWorkflowParams& params,
+    const SectorConstraint<BitType>* sector_constraint
 ) {
     using DetType = DeterminantT<BitType>;
     using CacheType = HijCacheT<BitType>;
-    
+
     auto start_time = std::chrono::high_resolution_clock::now();
-    
+
     IterativeWorkflowResult<BitType> result;
-    
+
+    // =========================================================================
+    // Milestone C2b-2: filtered recovery mode (Phase 0)
+    // =========================================================================
+    const bool filtered = sector_constraint && params.recovery.recovery_target > 0;
+    if (sector_constraint && !sector_constraint->prepared) {
+        throw std::invalid_argument(
+            "iterative_workflow_t: sector_constraint must be validated by "
+            "validate_and_prepare_sector_constraint before use");
+    }
+    if (filtered) {
+        validate_recovery_policy(params.recovery,
+                                 sector_constraint->protected_determinants.size(),
+                                 "iterative_workflow_t (Phase 0)");
+    }
+
     // =========================================================================
     // Parameter Extraction
     // =========================================================================
@@ -128,10 +147,40 @@ IterativeWorkflowResult<BitType> iterative_workflow_t(
     // =========================================================================
     std::vector<DetType> current_core_set = initial_dets;
     std::vector<double> current_core_coeffs = initial_coeffs;
-    
+
+    if (filtered) {
+        current_core_coeffs.resize(current_core_set.size(), 0.0);
+        // A supplied / loaded / warm-start / restart state is validated, never
+        // silently accepted: classify_initial_pool_t throws on any
+        // nonprotected LAS_PRESENT or CT_DISALLOWED member. (Randomly
+        // GENERATED Phase-0 supplements are screened by the generator using
+        // the same classifier and dropped before they reach here -- a
+        // different policy for a different provenance, deliberately.)
+        std::vector<SectorLabel> labels =
+            classify_initial_pool_t(current_core_set, *sector_constraint);
+        if (!sector_constraint->allow_las_absent_owned) {
+            for (auto label : labels) {
+                if (label == SectorLabel::LasAbsent) {
+                    throw std::invalid_argument(
+                        "iterative_workflow_t (Phase 0): initial determinants contain a LAS-absent "
+                        "(doorway) determinant while allow_las_absent_owned is false");
+                }
+            }
+        }
+        // The immutable protected seed is present from the first iteration,
+        // whatever the caller's (possibly stochastic) initial state contained.
+        std::unordered_set<DetType> present(current_core_set.begin(), current_core_set.end());
+        for (const auto& d : sector_constraint->protected_determinants) {
+            if (!present.count(d)) {
+                current_core_set.push_back(d);
+                current_core_coeffs.push_back(0.0);
+            }
+        }
+    }
+
     // Normalize initial coefficients
     normalize_coeffs(current_core_coeffs);
-    
+
     log_msg(verbosity, 1, "[C++ Workflow] Starting with " + 
             std::to_string(current_core_set.size()) + " initial determinants");
     
@@ -222,7 +271,15 @@ IterativeWorkflowResult<BitType> iterative_workflow_t(
     // =========================================================================
     int stagnation_count = 0;  // Count consecutive iterations without core set growth
     size_t prev_core_size = current_core_set.size();  // Track previous core set size
-    
+
+    // Milestone C2b-2 filtered-mode progress tracking. The high-water mark is
+    // deliberately compared against the CURRENT unique N_recovery: if TRIM or
+    // core reselection removes an R determinant the current count falls, and
+    // growth must continue rather than treat a historical discovery as still
+    // satisfying the target.
+    uint64_t recovery_high_water = 0;
+    int recovery_stagnant_iters = 0;
+
     for (int iteration = 0; iteration < max_iterations; ++iteration) {
         auto iter_start = std::chrono::high_resolution_clock::now();
         
@@ -282,6 +339,10 @@ IterativeWorkflowResult<BitType> iterative_workflow_t(
         pb_params.strategy_factor = strategy_factor;
         pb_params.strict_target_size = params.pool_strict_target_size;
         pb_params.max_pool_size = params.max_pool_size;
+        // Milestone C2b-2: the per-phase filtered-growth policy. Untouched
+        // (all-defaults) unless the caller asked for filtered recovery, so
+        // pool_build_t takes its classic path for every ordinary parent run.
+        pb_params.recovery = params.recovery;
 
         // Compute MI weights for "mi" screening mode
         if (pool_build_strategy == "mi" && !current_core_set.empty()) {
@@ -321,13 +382,18 @@ IterativeWorkflowResult<BitType> iterative_workflow_t(
         }
 
         // Call pool_build (stays in C++, no Python conversion!)
+        ScreeningTelemetry iter_events;
+        FilteredGrowthResult iter_pool_composition;
         auto pool_result = pool_build_t<BitType>(
             current_core_set, screening_coeffs, n_orb, h1, eri,
             effective_threshold, pool_size, cache, cache_file,
             attentive_orbitals, verbosity, pb_params, sparsity_ptr,
-            &double_exc_table
+            &double_exc_table,
+            sector_constraint,
+            sector_constraint ? &iter_events : nullptr,
+            filtered ? &iter_pool_composition : nullptr
         );
-        
+
         std::vector<DetType> pool = pool_result.first;
         double final_threshold = pool_result.second;
         
@@ -400,7 +466,10 @@ IterativeWorkflowResult<BitType> iterative_workflow_t(
             verbosity,
             sparsity_ptr,
             current_core_coeffs,  // warm start Davidson
-            params.davidson_init
+            params.davidson_init,
+            // Immutable P_K, separate from the mutable core above: guaranteed
+            // in every TRIM group subspace and in the final TRIM selection.
+            filtered ? &sector_constraint->protected_determinants : nullptr
         );
         
         current_energy = std::get<0>(trim_result);
@@ -494,17 +563,42 @@ IterativeWorkflowResult<BitType> iterative_workflow_t(
                     " -> " + std::to_string(new_size));
         }
         
-        // Truncate and normalize
-        current_core_set.resize(new_size);
-        current_core_coeffs.resize(new_size);
-        for (int i = 0; i < new_size; ++i) {
-            current_core_set[i] = sorted_dets[i];
-            current_core_coeffs[i] = sorted_coeffs[i];
+        // Truncate and normalize.
+        // Milestone C2b-2: in filtered mode this coefficient-sorted
+        // reselection is the one place Phase 0 could otherwise drop a
+        // protected determinant, so P_K is inserted first and the remaining
+        // slots are filled from the coefficient ranking. new_size is raised to
+        // hold P_K when an older total-size setting is smaller -- a protected
+        // determinant is never discarded to honor a size knob. Coefficients
+        // are carried by determinant identity, not by position.
+        current_core_set.clear();
+        current_core_coeffs.clear();
+        if (filtered) {
+            std::unordered_map<DetType, double> coeff_by_det;
+            for (size_t i = 0; i < sorted_dets.size(); ++i) {
+                coeff_by_det.emplace(sorted_dets[i], sorted_coeffs[i]);
+            }
+            for (const auto& d : sector_constraint->protected_determinants) {
+                auto it = coeff_by_det.find(d);
+                current_core_set.push_back(d);
+                current_core_coeffs.push_back(it != coeff_by_det.end() ? it->second : 0.0);
+            }
+            const auto& protected_set = sector_constraint->protected_determinants;
+            for (size_t i = 0; i < sorted_dets.size() &&
+                              static_cast<int>(current_core_set.size()) < new_size; ++i) {
+                if (protected_set.count(sorted_dets[i])) continue;
+                current_core_set.push_back(sorted_dets[i]);
+                current_core_coeffs.push_back(sorted_coeffs[i]);
+            }
+            new_size = static_cast<int>(current_core_set.size());
+        } else {
+            current_core_set.assign(sorted_dets.begin(), sorted_dets.begin() + new_size);
+            current_core_coeffs.assign(sorted_coeffs.begin(), sorted_coeffs.begin() + new_size);
         }
         normalize_coeffs(current_core_coeffs);
-        
+
         iter_info.core_set_size_after = new_size;
-        
+
         // Progress bar update (verbosity == 0 mode)
         if (show_progress_bar) {
             int current_progress_pct = (new_size * 100) / max_final_dets;
@@ -520,7 +614,43 @@ IterativeWorkflowResult<BitType> iterative_workflow_t(
         
         pool_size = static_cast<int>(std::ceil(new_size * pool_core_ratio));
         iter_info.next_pool_size = pool_size;
-        
+
+        // =====================================================================
+        // Milestone C2b-2: recompute composition from the determinants that
+        // ACTUALLY survived pool build, TRIM, and core reselection -- never
+        // from the running pool_build counters, and never from event
+        // telemetry. This is also the check that proves P_K is still intact.
+        // =====================================================================
+        if (filtered) {
+            FilteredStageTelemetry stage;
+            stage.phase = 0;
+            stage.index = iteration;
+            stage.events = iter_events;
+            stage.pool = iter_pool_composition;
+            stage.state = compose_and_validate_t(
+                current_core_set, *sector_constraint, params.recovery.recovery_target,
+                "iterative_workflow_t (Phase 0) core after TRIM/reselection");
+            stage.requested_recovery_target = params.recovery.recovery_target;
+            stage.target_met = stage.state.recovery_target_met;
+            result.filtered_telemetry.stages.push_back(stage);
+
+            if (stage.state.n_recovery > recovery_high_water) {
+                recovery_high_water = stage.state.n_recovery;
+                recovery_stagnant_iters = 0;
+            } else {
+                recovery_stagnant_iters++;
+            }
+            if (verbosity >= 1) {
+                log_msg(verbosity, 1, "[C++] Filtered Phase 0: N_protected="
+                        + std::to_string(stage.state.n_protected) + ", N_recovery="
+                        + std::to_string(stage.state.n_recovery) + "/"
+                        + std::to_string(params.recovery.recovery_target) + ", N_aux="
+                        + std::to_string(stage.state.n_aux) + ", N_work="
+                        + std::to_string(stage.state.n_work));
+            }
+        }
+
+
         // =====================================================================
         // STEP 6: Termination Conditions
         // =====================================================================
@@ -563,7 +693,39 @@ IterativeWorkflowResult<BitType> iterative_workflow_t(
         }
         
         // Check stopping criteria
-        
+
+        // 0. Milestone C2b-2: in filtered mode the target is the CURRENT
+        // unique N_recovery and nothing else -- not total core size, not
+        // max_final_dets, not pool size, not event counts, and not protected
+        // or doorway determinants. max_final_dets stopping is deliberately
+        // skipped below in this mode.
+        if (filtered) {
+            const auto& stage = result.filtered_telemetry.stages.back();
+            if (stage.target_met) {
+                log_msg(verbosity, 1, "[C++] Filtered Phase 0: recovery target reached.");
+                iter_info.stop_reason = "recovery_target_met";
+                result.termination_reason = "recovery_target_met";
+                result.iteration_history.back().stop_reason = iter_info.stop_reason;
+                break;
+            }
+            if (stage.pool.saturation_reason == SaturationReason::WorkingMemoryCeiling) {
+                log_msg(verbosity, 1, "[C++] Filtered Phase 0: working-space limit reached.");
+                iter_info.stop_reason = "work_limit";
+                result.termination_reason = "work_limit";
+                result.iteration_history.back().stop_reason = iter_info.stop_reason;
+                break;
+            }
+            if (params.recovery_stagnation_limit > 0
+                && recovery_stagnant_iters >= params.recovery_stagnation_limit) {
+                log_msg(verbosity, 1, "[C++] Filtered Phase 0: no new recovery determinants for "
+                        + std::to_string(recovery_stagnant_iters) + " iterations, stopping.");
+                iter_info.stop_reason = "recovery_stagnant";
+                result.termination_reason = "recovery_stagnant";
+                result.iteration_history.back().stop_reason = iter_info.stop_reason;
+                break;
+            }
+        }
+
         // 1. Schedule exhausted
         if (use_schedule && iteration >= static_cast<int>(core_set_schedule.size()) - 1) {
             log_msg(verbosity, 1, "[C++] Core set schedule exhausted, stopping.");
@@ -578,8 +740,9 @@ IterativeWorkflowResult<BitType> iterative_workflow_t(
             break;
         }
         
-        // 3. Max final dets (only if not using schedule)
-        if (!use_schedule && max_final_dets > 0 && 
+        // 3. Max final dets (only if not using schedule; never in filtered
+        //    mode, where a total-size stop would conflate P_K/O with R)
+        if (!filtered && !use_schedule && max_final_dets > 0 &&
             static_cast<int>(current_core_set.size()) >= max_final_dets) {
             log_msg(verbosity, 1, "[C++] Reached max_final_dets, stopping.");
             iter_info.stop_reason = "max_final_dets";
@@ -646,7 +809,21 @@ IterativeWorkflowResult<BitType> iterative_workflow_t(
     result.total_time = total_time;
     result.total_iterations = static_cast<int>(result.iteration_history.size());
     result.success = true;
-    
+
+    if (filtered) {
+        // Final state of the phase, reclassified from the returned
+        // determinants -- this is what the Phase-0 -> Phase-1 handoff carries.
+        result.filtered_composition = compose_and_validate_t(
+            result.final_dets, *sector_constraint, params.recovery.recovery_target,
+            "iterative_workflow_t (Phase 0) final state");
+        if (result.termination_reason.empty()) {
+            result.termination_reason = "max_iterations";
+        }
+        if (!result.filtered_telemetry.stages.empty()) {
+            result.filtered_telemetry.stages.back().termination_reason = result.termination_reason;
+        }
+    }
+
     return result;
 }
 
@@ -661,7 +838,8 @@ template IterativeWorkflowResult<uint64_t> iterative_workflow_t<uint64_t>(
     const std::vector<Determinant64>& initial_dets,
     const std::vector<double>& initial_coeffs,
     double nuclear_repulsion,
-    const IterativeWorkflowParams& params
+    const IterativeWorkflowParams& params,
+    const SectorConstraint<uint64_t>* sector_constraint
 );
 
 // Convenience wrapper
@@ -693,7 +871,8 @@ template IterativeWorkflowResult<std::array<uint64_t, 2>> iterative_workflow_t<s
     const std::vector<DeterminantT<std::array<uint64_t, 2>>>& initial_dets,
     const std::vector<double>& initial_coeffs,
     double nuclear_repulsion,
-    const IterativeWorkflowParams& params
+    const IterativeWorkflowParams& params,
+    const SectorConstraint<std::array<uint64_t, 2>>* sector_constraint
 );
 
 template IterativeWorkflowResult<std::array<uint64_t, 3>> iterative_workflow_t<std::array<uint64_t, 3>>(
@@ -704,7 +883,8 @@ template IterativeWorkflowResult<std::array<uint64_t, 3>> iterative_workflow_t<s
     const std::vector<DeterminantT<std::array<uint64_t, 3>>>& initial_dets,
     const std::vector<double>& initial_coeffs,
     double nuclear_repulsion,
-    const IterativeWorkflowParams& params
+    const IterativeWorkflowParams& params,
+    const SectorConstraint<std::array<uint64_t, 3>>* sector_constraint
 );
 
 template IterativeWorkflowResult<std::array<uint64_t, 4>> iterative_workflow_t<std::array<uint64_t, 4>>(
@@ -715,7 +895,8 @@ template IterativeWorkflowResult<std::array<uint64_t, 4>> iterative_workflow_t<s
     const std::vector<DeterminantT<std::array<uint64_t, 4>>>& initial_dets,
     const std::vector<double>& initial_coeffs,
     double nuclear_repulsion,
-    const IterativeWorkflowParams& params
+    const IterativeWorkflowParams& params,
+    const SectorConstraint<std::array<uint64_t, 4>>* sector_constraint
 );
 
 template IterativeWorkflowResult<std::array<uint64_t, 5>> iterative_workflow_t<std::array<uint64_t, 5>>(
@@ -726,7 +907,8 @@ template IterativeWorkflowResult<std::array<uint64_t, 5>> iterative_workflow_t<s
     const std::vector<DeterminantT<std::array<uint64_t, 5>>>& initial_dets,
     const std::vector<double>& initial_coeffs,
     double nuclear_repulsion,
-    const IterativeWorkflowParams& params
+    const IterativeWorkflowParams& params,
+    const SectorConstraint<std::array<uint64_t, 5>>* sector_constraint
 );
 
 template IterativeWorkflowResult<std::array<uint64_t, 6>> iterative_workflow_t<std::array<uint64_t, 6>>(
@@ -737,7 +919,8 @@ template IterativeWorkflowResult<std::array<uint64_t, 6>> iterative_workflow_t<s
     const std::vector<DeterminantT<std::array<uint64_t, 6>>>& initial_dets,
     const std::vector<double>& initial_coeffs,
     double nuclear_repulsion,
-    const IterativeWorkflowParams& params
+    const IterativeWorkflowParams& params,
+    const SectorConstraint<std::array<uint64_t, 6>>* sector_constraint
 );
 
 template IterativeWorkflowResult<std::array<uint64_t, 7>> iterative_workflow_t<std::array<uint64_t, 7>>(
@@ -748,7 +931,8 @@ template IterativeWorkflowResult<std::array<uint64_t, 7>> iterative_workflow_t<s
     const std::vector<DeterminantT<std::array<uint64_t, 7>>>& initial_dets,
     const std::vector<double>& initial_coeffs,
     double nuclear_repulsion,
-    const IterativeWorkflowParams& params
+    const IterativeWorkflowParams& params,
+    const SectorConstraint<std::array<uint64_t, 7>>* sector_constraint
 );
 
 template IterativeWorkflowResult<std::array<uint64_t, 8>> iterative_workflow_t<std::array<uint64_t, 8>>(
@@ -759,7 +943,8 @@ template IterativeWorkflowResult<std::array<uint64_t, 8>> iterative_workflow_t<s
     const std::vector<DeterminantT<std::array<uint64_t, 8>>>& initial_dets,
     const std::vector<double>& initial_coeffs,
     double nuclear_repulsion,
-    const IterativeWorkflowParams& params
+    const IterativeWorkflowParams& params,
+    const SectorConstraint<std::array<uint64_t, 8>>* sector_constraint
 );
 
 } // namespace trimci_core

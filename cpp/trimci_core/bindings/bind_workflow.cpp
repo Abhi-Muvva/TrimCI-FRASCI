@@ -1,5 +1,6 @@
 // Bindings for iterative workflow
 #include "bind_common.hpp"
+#include "bind_sector_common.hpp"
 
 #include "determinant.hpp"
 #include "iterative_workflow.hpp"
@@ -10,6 +11,7 @@
 #endif
 
 using namespace trimci_core;
+using namespace trimci_bind;
 
 template<size_t N>
 void bind_scalable_workflow(py::module& m, const std::string& suffix) {
@@ -26,11 +28,31 @@ void bind_scalable_workflow(py::module& m, const std::string& suffix) {
         .def_readonly("total_time", &ResultType::total_time)
         .def_readonly("total_iterations", &ResultType::total_iterations)
         .def_readonly("success", &ResultType::success)
-        .def_readonly("error_message", &ResultType::error_message);
+        .def_readonly("error_message", &ResultType::error_message)
+        .def_readonly("termination_reason", &ResultType::termination_reason)
+        .def_property_readonly("filtered_telemetry", [](const ResultType& r) {
+            return workflow_telemetry_to_list(r.filtered_telemetry); })
+        .def_property_readonly("filtered_composition", [](const ResultType& r) {
+            return filtered_result_to_dict(r.filtered_composition); });
 
     std::string fnName = "iterative_workflow_cpp_" + suffix;
+    // Wrapped rather than bound as a raw function pointer: iterative_workflow_t
+    // gained a trailing optional sector_constraint parameter in Milestone
+    // C2b-2, and this ordinary (unfiltered) entry point deliberately keeps its
+    // original Python signature and always passes no constraint.
     m.def(fnName.c_str(),
-          &iterative_workflow_t<std::array<uint64_t, N>>,
+          [](const std::vector<std::vector<double>>& h1,
+             const std::vector<double>& eri,
+             int n_alpha, int n_beta, int n_orb,
+             const std::string& system_name,
+             const std::vector<DetType>& initial_dets,
+             const std::vector<double>& initial_coeffs,
+             double nuclear_repulsion,
+             const IterativeWorkflowParams& params) {
+              return iterative_workflow_t<std::array<uint64_t, N>>(
+                  h1, eri, n_alpha, n_beta, n_orb, system_name,
+                  initial_dets, initial_coeffs, nuclear_repulsion, params);
+          },
           py::arg("h1"), py::arg("eri"),
           py::arg("n_alpha"), py::arg("n_beta"), py::arg("n_orb"),
           py::arg("system_name"),
@@ -69,6 +91,49 @@ void bind_scalable_workflow(py::module& m, const std::string& suffix) {
           py::arg("system_name"),
           py::arg("initial_dets"), py::arg("initial_coeffs"),
           py::arg("nuclear_repulsion"), py::arg("params"));
+
+    // Milestone C2b-2: filtered Phase 0. The constraint arrives as an
+    // already-validated shared handle, so pybind keeps it alive for the whole
+    // synchronous call even with the GIL released -- no raw pointer escapes
+    // Python's ownership. Omitting it (or leaving params.recovery at its
+    // defaults) is exactly the unfiltered workflow above.
+    std::string fnNameFiltered = "iterative_workflow_filtered_" + suffix;
+    m.def(fnNameFiltered.c_str(),
+          [](const std::vector<std::vector<double>>& h1,
+             const std::vector<double>& eri,
+             int n_alpha, int n_beta, int n_orb,
+             const std::string& system_name,
+             const std::vector<DetType>& initial_dets,
+             const std::vector<double>& initial_coeffs,
+             double nuclear_repulsion,
+             const IterativeWorkflowParams& params,
+             std::shared_ptr<SectorConstraint<std::array<uint64_t, N>>> constraint) {
+              py::gil_scoped_release release;
+              return iterative_workflow_t<std::array<uint64_t, N>>(
+                  h1, eri, n_alpha, n_beta, n_orb, system_name,
+                  initial_dets, initial_coeffs, nuclear_repulsion, params,
+                  constraint.get());
+          },
+          py::arg("h1"), py::arg("eri"),
+          py::arg("n_alpha"), py::arg("n_beta"), py::arg("n_orb"),
+          py::arg("system_name"),
+          py::arg("initial_dets"), py::arg("initial_coeffs"),
+          py::arg("nuclear_repulsion"), py::arg("params"),
+          py::arg("sector_constraint"));
+}
+
+
+// Milestone C2b-2: the GPU Phase-0 kernels do not implement the sector
+// constraint. Rather than silently running unfiltered -- which would look like
+// a successful filtered recovery and quietly produce forbidden determinants --
+// any GPU call that asks for filtered growth fails loudly.
+static void reject_filtered_on_gpu(const IterativeWorkflowParams& params) {
+    if (params.recovery.recovery_target > 0) {
+        throw std::invalid_argument(
+            "GPU iterative workflow does not support the filter-aware recovery "
+            "sector constraint (params.recovery.recovery_target > 0). Use the CPU "
+            "iterative_workflow_filtered_* entry points instead.");
+    }
 }
 
 void bind_iterative_workflow(py::module& m) {
@@ -106,7 +171,10 @@ void bind_iterative_workflow(py::module& m) {
         .def_readwrite("save_period", &IterativeWorkflowParams::save_period)
         .def_readwrite("save_pool", &IterativeWorkflowParams::save_pool)
         .def_readwrite("save_initial", &IterativeWorkflowParams::save_initial)
-        .def_readwrite("output_dir", &IterativeWorkflowParams::output_dir);
+        .def_readwrite("output_dir", &IterativeWorkflowParams::output_dir)
+        .def_readwrite("recovery", &IterativeWorkflowParams::recovery)
+        .def_readwrite("recovery_stagnation_limit",
+                       &IterativeWorkflowParams::recovery_stagnation_limit);
 
     py::class_<IterationInfo>(m, "IterationInfo")
         .def(py::init<>())
@@ -136,7 +204,12 @@ void bind_iterative_workflow(py::module& m) {
         .def_readonly("total_time", &IterativeWorkflowResult64::total_time)
         .def_readonly("total_iterations", &IterativeWorkflowResult64::total_iterations)
         .def_readonly("success", &IterativeWorkflowResult64::success)
-        .def_readonly("error_message", &IterativeWorkflowResult64::error_message);
+        .def_readonly("error_message", &IterativeWorkflowResult64::error_message)
+        .def_readonly("termination_reason", &IterativeWorkflowResult64::termination_reason)
+        .def_property_readonly("filtered_telemetry", [](const IterativeWorkflowResult64& r) {
+            return workflow_telemetry_to_list(r.filtered_telemetry); })
+        .def_property_readonly("filtered_composition", [](const IterativeWorkflowResult64& r) {
+            return filtered_result_to_dict(r.filtered_composition); });
 
     m.def("iterative_workflow_cpp", &iterative_workflow,
           py::arg("h1"), py::arg("eri"),
@@ -180,6 +253,33 @@ void bind_iterative_workflow(py::module& m) {
           py::arg("params"),
           "Numpy-optimized C++ iterative_workflow.");
 
+
+    m.def("iterative_workflow_filtered_64",
+          [](const std::vector<std::vector<double>>& h1,
+             const std::vector<double>& eri,
+             int n_alpha, int n_beta, int n_orb,
+             const std::string& system_name,
+             const std::vector<Determinant64>& initial_dets,
+             const std::vector<double>& initial_coeffs,
+             double nuclear_repulsion,
+             const IterativeWorkflowParams& params,
+             std::shared_ptr<SectorConstraint<uint64_t>> constraint) {
+              py::gil_scoped_release release;
+              return iterative_workflow_t<uint64_t>(
+                  h1, eri, n_alpha, n_beta, n_orb, system_name,
+                  initial_dets, initial_coeffs, nuclear_repulsion, params,
+                  constraint.get());
+          },
+          py::arg("h1"), py::arg("eri"),
+          py::arg("n_alpha"), py::arg("n_beta"), py::arg("n_orb"),
+          py::arg("system_name"),
+          py::arg("initial_dets"), py::arg("initial_coeffs"),
+          py::arg("nuclear_repulsion"), py::arg("params"),
+          py::arg("sector_constraint"),
+          "Filter-aware Phase 0 (Milestone C2b-2). Requires a validated "
+          "SectorConstraint64 handle; params.recovery.recovery_target > 0 "
+          "switches stopping to unique N_recovery.");
+
     bind_scalable_workflow<2>(m, "128");
     bind_scalable_workflow<3>(m, "192");
     bind_scalable_workflow<4>(m, "256");
@@ -191,25 +291,43 @@ void bind_iterative_workflow(py::module& m) {
 #ifdef TRIMCI_HAS_GPU
     // GPU-accelerated iterative workflow bindings
     m.def("iterative_workflow_gpu_128",
-          &trimci_gpu::iterative_workflow_gpu_128,
+          [](const std::vector<std::vector<double>>& h1, const std::vector<double>& eri,
+             int n_alpha, int n_beta, int n_orb, const std::string& system_name,
+             const std::vector<DeterminantT<std::array<uint64_t, 2>>>& initial_dets,
+             const std::vector<double>& initial_coeffs, double nuclear_repulsion,
+             const IterativeWorkflowParams& params) {
+              reject_filtered_on_gpu(params);
+              py::gil_scoped_release release;
+              return trimci_gpu::iterative_workflow_gpu_128(
+                  h1, eri, n_alpha, n_beta, n_orb, system_name,
+                  initial_dets, initial_coeffs, nuclear_repulsion, params);
+          },
           py::arg("h1"), py::arg("eri"),
           py::arg("n_alpha"), py::arg("n_beta"), py::arg("n_orb"),
           py::arg("system_name"),
           py::arg("initial_dets"), py::arg("initial_coeffs"),
           py::arg("nuclear_repulsion"),
           py::arg("params"),
-          py::call_guard<py::gil_scoped_release>(),
           "GPU-accelerated iterative workflow (128-bit determinants, up to 128 orbitals).");
 
     m.def("iterative_workflow_gpu_64",
-          &trimci_gpu::iterative_workflow_gpu_64,
+          [](const std::vector<std::vector<double>>& h1, const std::vector<double>& eri,
+             int n_alpha, int n_beta, int n_orb, const std::string& system_name,
+             const std::vector<Determinant64>& initial_dets,
+             const std::vector<double>& initial_coeffs, double nuclear_repulsion,
+             const IterativeWorkflowParams& params) {
+              reject_filtered_on_gpu(params);
+              py::gil_scoped_release release;
+              return trimci_gpu::iterative_workflow_gpu_64(
+                  h1, eri, n_alpha, n_beta, n_orb, system_name,
+                  initial_dets, initial_coeffs, nuclear_repulsion, params);
+          },
           py::arg("h1"), py::arg("eri"),
           py::arg("n_alpha"), py::arg("n_beta"), py::arg("n_orb"),
           py::arg("system_name"),
           py::arg("initial_dets"), py::arg("initial_coeffs"),
           py::arg("nuclear_repulsion"),
           py::arg("params"),
-          py::call_guard<py::gil_scoped_release>(),
           "GPU-accelerated iterative workflow (64-bit determinants, up to 64 orbitals).");
 
     // Multi-run variants: share a single GpuContext + integrals upload across N runs.
@@ -217,7 +335,19 @@ void bind_iterative_workflow(py::module& m) {
     // random seed states). initial_dets_list / initial_coeffs_list must have
     // size == num_runs (per-run) or size == 1 (broadcast shared state).
     m.def("iterative_workflow_gpu_multi_128",
-          &trimci_gpu::iterative_workflow_gpu_multi_128,
+          [](const std::vector<std::vector<double>>& h1, const std::vector<double>& eri,
+             int n_alpha, int n_beta, int n_orb, const std::string& system_name,
+             const std::vector<std::vector<DeterminantT<std::array<uint64_t, 2>>>>& initial_dets_list,
+             const std::vector<std::vector<double>>& initial_coeffs_list,
+             double nuclear_repulsion, const IterativeWorkflowParams& params,
+             int num_runs, const std::vector<uint64_t>& seeds) {
+              reject_filtered_on_gpu(params);
+              py::gil_scoped_release release;
+              return trimci_gpu::iterative_workflow_gpu_multi_128(
+                  h1, eri, n_alpha, n_beta, n_orb, system_name,
+                  initial_dets_list, initial_coeffs_list, nuclear_repulsion,
+                  params, num_runs, seeds);
+          },
           py::arg("h1"), py::arg("eri"),
           py::arg("n_alpha"), py::arg("n_beta"), py::arg("n_orb"),
           py::arg("system_name"),
@@ -226,7 +356,6 @@ void bind_iterative_workflow(py::module& m) {
           py::arg("params"),
           py::arg("num_runs"),
           py::arg("seeds") = std::vector<uint64_t>{},
-          py::call_guard<py::gil_scoped_release>(),
           "GPU multi-run workflow (128-bit dets); uploads integrals once and runs num_runs "
           "independent TRIM workflows sharing the GpuContext. initial_dets_list / "
           "initial_coeffs_list have size == num_runs for per-run state or size == 1 to "
@@ -234,7 +363,19 @@ void bind_iterative_workflow(py::module& m) {
           "(0 = wall-clock).");
 
     m.def("iterative_workflow_gpu_multi_64",
-          &trimci_gpu::iterative_workflow_gpu_multi_64,
+          [](const std::vector<std::vector<double>>& h1, const std::vector<double>& eri,
+             int n_alpha, int n_beta, int n_orb, const std::string& system_name,
+             const std::vector<std::vector<Determinant64>>& initial_dets_list,
+             const std::vector<std::vector<double>>& initial_coeffs_list,
+             double nuclear_repulsion, const IterativeWorkflowParams& params,
+             int num_runs, const std::vector<uint64_t>& seeds) {
+              reject_filtered_on_gpu(params);
+              py::gil_scoped_release release;
+              return trimci_gpu::iterative_workflow_gpu_multi_64(
+                  h1, eri, n_alpha, n_beta, n_orb, system_name,
+                  initial_dets_list, initial_coeffs_list, nuclear_repulsion,
+                  params, num_runs, seeds);
+          },
           py::arg("h1"), py::arg("eri"),
           py::arg("n_alpha"), py::arg("n_beta"), py::arg("n_orb"),
           py::arg("system_name"),
@@ -243,7 +384,6 @@ void bind_iterative_workflow(py::module& m) {
           py::arg("params"),
           py::arg("num_runs"),
           py::arg("seeds") = std::vector<uint64_t>{},
-          py::call_guard<py::gil_scoped_release>(),
           "GPU multi-run workflow (64-bit dets); see multi_128 for details.");
 
     // GPU 4-index integral transform (Phase 1 of GPU BFGS orbital opt).

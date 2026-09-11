@@ -1,5 +1,6 @@
 // Bindings for Fast Expansion module
 #include "bind_common.hpp"
+#include "bind_sector_common.hpp"
 #include "fast_expansion/fe_types.hpp"
 #include "fast_expansion/ab_group_matvec.hpp"
 #include "fast_expansion/ab_index.hpp"
@@ -13,6 +14,7 @@
 #include "fast_expansion/ab_group_matvec.hpp"
 
 using namespace trimci_core;
+using namespace trimci_bind;
 using namespace trimci_core::fe;
 
 void bind_fast_expansion(py::module& m) {
@@ -407,6 +409,9 @@ void bind_fast_expansion(py::module& m) {
         .def_readwrite("log_file", &ExpansionConfig<uint64_t>::log_file)
         .def_readwrite("checkpoint_dir", &ExpansionConfig<uint64_t>::checkpoint_dir)
         .def_readwrite("checkpoint_round_offset", &ExpansionConfig<uint64_t>::checkpoint_round_offset)
+        .def_readwrite("sector_constraint", &ExpansionConfig<uint64_t>::sector_constraint)
+        .def_readwrite("recovery", &ExpansionConfig<uint64_t>::recovery)
+        .def_readwrite("phase_index", &ExpansionConfig<uint64_t>::phase_index)
         .def_property("pt2_config",
             [](const ExpansionConfig<uint64_t>& c) -> py::object {
                 if (c.pt2_config.has_value()) return py::cast(c.pt2_config.value());
@@ -437,6 +442,11 @@ void bind_fast_expansion(py::module& m) {
         .def_readonly("screening_error_history", &ExpansionResult<uint64_t>::screening_error_history)
         .def_readonly("dressed_energy_history", &ExpansionResult<uint64_t>::dressed_energy_history)
         .def_readonly("dressed_pt2_energy_history", &ExpansionResult<uint64_t>::dressed_pt2_energy_history)
+        .def_readonly("termination_reason", &ExpansionResult<uint64_t>::termination_reason)
+        .def_property_readonly("filtered_telemetry", [](const ExpansionResult<uint64_t>& r) {
+            return workflow_telemetry_to_list(r.filtered_telemetry); })
+        .def_property_readonly("filtered_composition", [](const ExpansionResult<uint64_t>& r) {
+            return filtered_result_to_dict(r.filtered_composition); })
         .def("get_alpha_beta", [](const ExpansionResult<uint64_t>& res)
             -> std::pair<py::array_t<uint64_t>, py::array_t<uint64_t>>
         {
@@ -639,6 +649,9 @@ void bind_fast_expansion(py::module& m) {
         .def_readwrite("log_file", &Cfg128::log_file)
         .def_readwrite("checkpoint_dir", &Cfg128::checkpoint_dir)
         .def_readwrite("checkpoint_round_offset", &Cfg128::checkpoint_round_offset)
+        .def_readwrite("sector_constraint", &Cfg128::sector_constraint)
+        .def_readwrite("recovery", &Cfg128::recovery)
+        .def_readwrite("phase_index", &Cfg128::phase_index)
         .def_property("pt2_config",
             [](const Cfg128& c) -> py::object {
                 if (c.pt2_config.has_value()) return py::cast(c.pt2_config.value());
@@ -669,6 +682,11 @@ void bind_fast_expansion(py::module& m) {
         .def_readonly("screening_error_history", &Res128::screening_error_history)
         .def_readonly("dressed_energy_history", &Res128::dressed_energy_history)
         .def_readonly("dressed_pt2_energy_history", &Res128::dressed_pt2_energy_history)
+        .def_readonly("termination_reason", &Res128::termination_reason)
+        .def_property_readonly("filtered_telemetry", [](const Res128& r) {
+            return workflow_telemetry_to_list(r.filtered_telemetry); })
+        .def_property_readonly("filtered_composition", [](const Res128& r) {
+            return filtered_result_to_dict(r.filtered_composition); })
         .def("get_alpha_beta", [](const Res128& res)
             -> std::pair<py::array_t<uint64_t>, py::array_t<uint64_t>>
         {

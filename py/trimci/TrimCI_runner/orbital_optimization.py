@@ -72,6 +72,26 @@ def run_orbital_optimization(h1, eri, n_alpha, n_beta, n_orb, mol_name, args, nu
     # Lazy import to avoid circular dependency
     from .trimci_driver import run_trimci_main_calculation
 
+    # Milestone C2b-2: this optimizer passes state between cycles through NPZ
+    # files holding only determinants and coefficients (see last_dets_path /
+    # load_initial_dets_from_file below). That file cannot carry the sector
+    # constraint, the fragment blocks and reference sectors, the fragment LAS
+    # supports, n_ct_max, allow_las_absent_owned, the recovery targets, or the
+    # classification telemetry -- so a filtered recovery run driven through
+    # here would silently become an unfiltered one on the second cycle. Reject
+    # it instead; filtered recovery orbital optimization runs inside
+    # run_expansion's own per-round BFGS, where the constraint stays in memory
+    # on the ExpansionConfig for the whole phase.
+    if getattr(args, 'sector_constraint', None) is not None or \
+            getattr(args, 'recovery_target', 0):
+        raise ValueError(
+            "run_orbital_optimization does not support filter-aware recovery: its "
+            "cycle-to-cycle NPZ handoff carries only determinants and coefficients, "
+            "not the sector constraint or the protected seed. Use the in-memory "
+            "filtered phased stream (iterative_workflow_filtered_* then "
+            "fe.run_expansion_phased with ExpansionConfig.sector_constraint set)."
+        )
+
     args = copy.deepcopy(args)
 
     unique_ts = generate_unique_timestamp()
