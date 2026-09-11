@@ -110,6 +110,7 @@ pybind11_add_module(trimci_core
     trimci/screening.cpp
     trimci/trim.cpp
     trimci/iterative_workflow.cpp
+    trimci/sector_constraint.cpp
     # solvers/
     solvers/davidson_gep.cpp
     solvers/matfree_davidson.cpp
@@ -154,6 +155,7 @@ pybind11_add_module(trimci_core
     bindings/bind_solvers.cpp
     bindings/bind_fast_expansion.cpp
     bindings/bind_davidson_utils.cpp
+    bindings/bind_sector_constraint.cpp
     module.cpp
 )
 

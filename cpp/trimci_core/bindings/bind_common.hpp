@@ -23,3 +23,4 @@ void bind_davidson_gep(py::module& m);
 void bind_matfree_davidson(py::module& m);
 void bind_fast_expansion(py::module& m);
 void bind_davidson_utils(py::module& m);
+void bind_sector_constraint(py::module& m);

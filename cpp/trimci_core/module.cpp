@@ -16,4 +16,5 @@ PYBIND11_MODULE(trimci_core, m) {
     bind_matfree_davidson(m);
     bind_fast_expansion(m);
     bind_davidson_utils(m);
+    bind_sector_constraint(m);
 }
