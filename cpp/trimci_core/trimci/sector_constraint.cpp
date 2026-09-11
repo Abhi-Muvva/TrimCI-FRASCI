@@ -1,8 +1,141 @@
 #include "sector_constraint.hpp"
 
 #include <cstdlib>
+#include <stdexcept>
+#include <string>
+#include <type_traits>
 
 namespace trimci_core {
+
+namespace {
+
+template<typename StorageType>
+StorageType bitwise_and(const StorageType& a, const StorageType& b) {
+    if constexpr (std::is_same_v<StorageType, uint64_t>) {
+        return a & b;
+    } else {
+        StorageType out{};
+        for (size_t i = 0; i < a.size(); ++i) out[i] = a[i] & b[i];
+        return out;
+    }
+}
+
+// Fragment-support lookup only (does NOT check the fragment sector itself --
+// callers that have not already established `owned` must use is_las_present).
+template<typename StorageType>
+bool fragment_support_lookup_all(
+    const DeterminantT<StorageType>& det, const SectorConstraint<StorageType>& c)
+{
+    for (size_t f = 0; f < c.fragment_blocks.size(); ++f) {
+        StorageType masked_alpha = bitwise_and(det.alpha, c.fragment_mask[f]);
+        StorageType masked_beta = bitwise_and(det.beta, c.fragment_mask[f]);
+        if (!c.fragment_support[f].count(DeterminantT<StorageType>(masked_alpha, masked_beta))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Full LAS-present test: same-sector in every fragment AND every fragment's
+// local restriction is in that fragment's stored support. Used by validation
+// (protected determinants) where "owned" has not already been established, so
+// it cannot reuse the classify_determinant_t hot path (which special-cases
+// `protected_determinants` first).
+template<typename StorageType>
+bool is_las_present(const DeterminantT<StorageType>& det, const SectorConstraint<StorageType>& c) {
+    for (size_t f = 0; f < c.fragment_blocks.size(); ++f) {
+        const auto& block = c.fragment_blocks[f];
+        int na = 0, nb = 0;
+        for (int orb : block) {
+            if (BitOps<StorageType>::get_bit(det.alpha, orb)) ++na;
+            if (BitOps<StorageType>::get_bit(det.beta, orb)) ++nb;
+        }
+        if (na != c.reference_alpha[f] || nb != c.reference_beta[f]) return false;
+    }
+    return fragment_support_lookup_all(det, c);
+}
+
+} // namespace
+
+template<typename StorageType>
+void validate_and_prepare_sector_constraint(SectorConstraint<StorageType>& constraint, int n_orb) {
+    const size_t n_frag = constraint.fragment_blocks.size();
+    if (constraint.reference_alpha.size() != n_frag
+        || constraint.reference_beta.size() != n_frag
+        || constraint.fragment_support.size() != n_frag) {
+        throw std::invalid_argument(
+            "SectorConstraint: fragment_blocks, reference_alpha, reference_beta, and "
+            "fragment_support must all have the same length");
+    }
+
+    std::vector<bool> orbital_claimed(static_cast<size_t>(n_orb), false);
+    constraint.fragment_mask.assign(n_frag, StorageType{});
+
+    for (size_t f = 0; f < n_frag; ++f) {
+        const auto& block = constraint.fragment_blocks[f];
+        StorageType mask{};
+        for (int orb : block) {
+            if (orb < 0 || orb >= n_orb) {
+                throw std::invalid_argument(
+                    "SectorConstraint: fragment " + std::to_string(f) + " orbital "
+                    + std::to_string(orb) + " is out of range [0, " + std::to_string(n_orb) + ")");
+            }
+            if (orbital_claimed[static_cast<size_t>(orb)]) {
+                throw std::invalid_argument(
+                    "SectorConstraint: orbital " + std::to_string(orb)
+                    + " is claimed by more than one fragment block");
+            }
+            orbital_claimed[static_cast<size_t>(orb)] = true;
+            BitOps<StorageType>::set_bit(mask, orb);
+        }
+        constraint.fragment_mask[f] = mask;
+
+        const int ra = constraint.reference_alpha[f];
+        const int rb = constraint.reference_beta[f];
+        const int block_size = static_cast<int>(block.size());
+        if (ra < 0 || rb < 0 || ra > block_size || rb > block_size) {
+            throw std::invalid_argument(
+                "SectorConstraint: fragment " + std::to_string(f) + " reference sector ("
+                + std::to_string(ra) + "," + std::to_string(rb) + ") is inconsistent with its "
+                + std::to_string(block_size) + "-orbital block");
+        }
+
+        for (const auto& local_det : constraint.fragment_support[f]) {
+            const size_t total_a = local_det.getOccupiedAlpha().size();
+            const size_t total_b = local_det.getOccupiedBeta().size();
+            const StorageType masked_alpha = bitwise_and(local_det.alpha, mask);
+            const StorageType masked_beta = bitwise_and(local_det.beta, mask);
+            const size_t in_mask_a =
+                DeterminantT<StorageType>(masked_alpha, StorageType{}).getOccupiedAlpha().size();
+            const size_t in_mask_b =
+                DeterminantT<StorageType>(StorageType{}, masked_beta).getOccupiedBeta().size();
+            if (in_mask_a != total_a || in_mask_b != total_b) {
+                throw std::invalid_argument(
+                    "SectorConstraint: fragment " + std::to_string(f)
+                    + " support determinant has bits outside its own orbital block");
+            }
+            if (static_cast<int>(total_a) != ra || static_cast<int>(total_b) != rb) {
+                throw std::invalid_argument(
+                    "SectorConstraint: fragment " + std::to_string(f)
+                    + " support determinant does not match the fragment's own reference sector");
+            }
+        }
+    }
+
+    if (constraint.n_ct_max < 0) {
+        throw std::invalid_argument("SectorConstraint: n_ct_max must be nonnegative");
+    }
+
+    for (const auto& det : constraint.protected_determinants) {
+        if (!is_las_present(det, constraint)) {
+            throw std::invalid_argument(
+                "SectorConstraint: a protected determinant is not LAS-present "
+                "(P_K must be a subset of P_LAS)");
+        }
+    }
+
+    constraint.prepared = true;
+}
 
 template<typename StorageType>
 SectorClassification classify_determinant_t(
@@ -32,22 +165,7 @@ SectorClassification classify_determinant_t(
     }
 
     if (owned) {
-        bool las_present = true;
-        for (size_t f = 0; f < n_frag; ++f) {
-            const auto& block = constraint.fragment_blocks[f];
-            uint64_t local_alpha = 0, local_beta = 0;
-            for (size_t local = 0; local < block.size(); ++local) {
-                int orb = block[local];
-                if (BitOps<StorageType>::get_bit(det.alpha, orb)) local_alpha |= (uint64_t(1) << local);
-                if (BitOps<StorageType>::get_bit(det.beta, orb)) local_beta |= (uint64_t(1) << local);
-            }
-            uint64_t key = (local_alpha << block.size()) | local_beta;
-            if (!constraint.fragment_support[f].count(key)) {
-                las_present = false;
-                break;
-            }
-        }
-        if (las_present) {
+        if (fragment_support_lookup_all(det, constraint)) {
             return SectorClassification{SectorLabel::LasPresent, 0, false};
         }
         bool admitted = constraint.allow_las_absent_owned && heat_bath_passed;
@@ -67,21 +185,23 @@ SectorClassification classify_determinant_t(
 // Explicit instantiations: every determinant storage type pool_build_t itself
 // already supports (screening.cpp's own instantiation list), so the sector
 // constraint has no 64-orbital-only special path.
-template SectorClassification classify_determinant_t<uint64_t>(
-    const DeterminantT<uint64_t>&, const SectorConstraint<uint64_t>&, bool);
-template SectorClassification classify_determinant_t<std::array<uint64_t, 2>>(
-    const DeterminantT<std::array<uint64_t, 2>>&, const SectorConstraint<std::array<uint64_t, 2>>&, bool);
-template SectorClassification classify_determinant_t<std::array<uint64_t, 3>>(
-    const DeterminantT<std::array<uint64_t, 3>>&, const SectorConstraint<std::array<uint64_t, 3>>&, bool);
-template SectorClassification classify_determinant_t<std::array<uint64_t, 4>>(
-    const DeterminantT<std::array<uint64_t, 4>>&, const SectorConstraint<std::array<uint64_t, 4>>&, bool);
-template SectorClassification classify_determinant_t<std::array<uint64_t, 5>>(
-    const DeterminantT<std::array<uint64_t, 5>>&, const SectorConstraint<std::array<uint64_t, 5>>&, bool);
-template SectorClassification classify_determinant_t<std::array<uint64_t, 6>>(
-    const DeterminantT<std::array<uint64_t, 6>>&, const SectorConstraint<std::array<uint64_t, 6>>&, bool);
-template SectorClassification classify_determinant_t<std::array<uint64_t, 7>>(
-    const DeterminantT<std::array<uint64_t, 7>>&, const SectorConstraint<std::array<uint64_t, 7>>&, bool);
-template SectorClassification classify_determinant_t<std::array<uint64_t, 8>>(
-    const DeterminantT<std::array<uint64_t, 8>>&, const SectorConstraint<std::array<uint64_t, 8>>&, bool);
+// Variadic because std::array<uint64_t, N> contains a comma, which the
+// preprocessor would otherwise split into extra macro arguments.
+#define TRIMCI_INSTANTIATE_SECTOR_CONSTRAINT(...)                                          \
+    template void validate_and_prepare_sector_constraint<__VA_ARGS__>(                     \
+        SectorConstraint<__VA_ARGS__>&, int);                                              \
+    template SectorClassification classify_determinant_t<__VA_ARGS__>(                     \
+        const DeterminantT<__VA_ARGS__>&, const SectorConstraint<__VA_ARGS__>&, bool);
+
+TRIMCI_INSTANTIATE_SECTOR_CONSTRAINT(uint64_t)
+TRIMCI_INSTANTIATE_SECTOR_CONSTRAINT(std::array<uint64_t, 2>)
+TRIMCI_INSTANTIATE_SECTOR_CONSTRAINT(std::array<uint64_t, 3>)
+TRIMCI_INSTANTIATE_SECTOR_CONSTRAINT(std::array<uint64_t, 4>)
+TRIMCI_INSTANTIATE_SECTOR_CONSTRAINT(std::array<uint64_t, 5>)
+TRIMCI_INSTANTIATE_SECTOR_CONSTRAINT(std::array<uint64_t, 6>)
+TRIMCI_INSTANTIATE_SECTOR_CONSTRAINT(std::array<uint64_t, 7>)
+TRIMCI_INSTANTIATE_SECTOR_CONSTRAINT(std::array<uint64_t, 8>)
+
+#undef TRIMCI_INSTANTIATE_SECTOR_CONSTRAINT
 
 } // namespace trimci_core

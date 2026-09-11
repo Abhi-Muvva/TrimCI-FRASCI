@@ -351,7 +351,9 @@ pool_build_t(
     int verbosity,
     const PoolBuildParams& params,
     const IntegralSparsityInfo* precomputed_sparsity,
-    const DoubleExcTable* precomputed_table
+    const DoubleExcTable* precomputed_table,
+    const SectorConstraint<StorageType>* sector_constraint,
+    ScreeningTelemetry* telemetry_out
 ) {
     // Extract parameters from struct
     const std::string& screening_mode = params.screening_mode;
@@ -446,6 +448,10 @@ pool_build_t(
         pool_map[d] = std::numeric_limits<double>::infinity();
     }
     if (verbosity >= 2) std::cout << "[PoolBuild] RSS after pool_map(reserve+fill " << pool_map.size() << "): " << get_rss_mb() << " MB" << std::endl;
+
+    // Milestone C2a: accumulates across every round/chunk of the loop below.
+    // Untouched when sector_constraint is nullptr (disabled path).
+    ScreeningTelemetry aggregate_telemetry;
 
     // Control whether to use coefficient map
     bool use_coeffs = !initial_coeffs.empty();
@@ -629,6 +635,7 @@ pool_build_t(
             size_t chunks_processed = 0;
             size_t pool_before_chunks = pool_map.size();
             std::vector<std::vector<LightCandidate>> thread_light_candidates(n_threads);
+            std::vector<ScreeningTelemetry> thread_telemetry(sector_constraint ? n_threads : 0);
             size_t total_candidates_processed = 0;
             size_t consecutive_zero_chunks = 0;
             const size_t MAX_ZERO_CHUNKS = 10;
@@ -639,6 +646,7 @@ pool_build_t(
 
                 // Clear buffers (capacity retained for reuse)
                 for (auto& v : thread_light_candidates) v.clear();
+                for (auto& t : thread_telemetry) t.reset();
 
                 #pragma omp parallel
                 {
@@ -660,11 +668,25 @@ pool_build_t(
                         double local_threshold = threshold / std::max(abs_ci, 1e-12);
 
                         auto locals = process_parent_worker_t(det, n_orb, local_threshold, *table_ptr, h1, eri, attentive_set, sparsity_ptr);
+                        if (sector_constraint) thread_telemetry[tid].generated += locals.size();
 
                         for (auto& pr : locals) {
                             const auto& dj = pr.first;
                             double hij = pr.second;
-                            if (std::abs(hij) > local_threshold && pool_map.count(dj) == 0) {
+                            bool hb_pass = std::abs(hij) > local_threshold;
+                            bool sector_admit = true;
+                            if (hb_pass && sector_constraint) {
+                                SectorClassification result = screen_candidate_t(dj, *sector_constraint);
+                                int label_idx = static_cast<int>(result.label);
+                                thread_telemetry[tid].hb_passing[label_idx]++;
+                                if (result.admitted) {
+                                    thread_telemetry[tid].admitted[label_idx]++;
+                                } else {
+                                    thread_telemetry[tid].rejected[label_idx]++;
+                                }
+                                sector_admit = result.admitted;
+                            }
+                            if (hb_pass && sector_admit && pool_map.count(dj) == 0) {
                                 double heat_bath_score = std::abs(hij * abs_ci);
                                 // MI-weighted scoring: boost excitations involving correlated orbitals
                                 if (use_mi_weights) {
@@ -701,6 +723,10 @@ pool_build_t(
                         }
                     }
                 } // omp parallel end
+
+                if (sector_constraint) {
+                    for (const auto& t : thread_telemetry) aggregate_telemetry.merge(t);
+                }
 
                 // P5: Merge this chunk's candidates into pool_map (MAX score update)
                 size_t chunk_candidates = 0;
@@ -788,6 +814,7 @@ pool_build_t(
         } else {
         // ---- PT2 modes: full pass (need all candidates for sorting) ----
         std::vector<std::vector<Candidate>> thread_candidates(n_threads);
+        std::vector<ScreeningTelemetry> thread_telemetry_pt2(sector_constraint ? n_threads : 0);
 
         #pragma omp parallel
         {
@@ -808,17 +835,35 @@ pool_build_t(
                 double local_threshold = threshold / std::max(abs_ci, 1e-12);
 
                 auto locals = process_parent_worker_t(det, n_orb, local_threshold, *table_ptr, h1, eri, attentive_set, sparsity_ptr);
+                if (sector_constraint) thread_telemetry_pt2[tid].generated += locals.size();
 
                 for (auto& pr : locals) {
                     const auto& dj = pr.first;
                     double hij = pr.second;
-                    if (std::abs(hij) > local_threshold) {
+                    bool hb_pass = std::abs(hij) > local_threshold;
+                    bool sector_admit = true;
+                    if (hb_pass && sector_constraint) {
+                        SectorClassification result = screen_candidate_t(dj, *sector_constraint);
+                        int label_idx = static_cast<int>(result.label);
+                        thread_telemetry_pt2[tid].hb_passing[label_idx]++;
+                        if (result.admitted) {
+                            thread_telemetry_pt2[tid].admitted[label_idx]++;
+                        } else {
+                            thread_telemetry_pt2[tid].rejected[label_idx]++;
+                        }
+                        sector_admit = result.admitted;
+                    }
+                    if (hb_pass && sector_admit) {
                         double heat_bath_score = std::abs(hij * abs_ci);
                         thread_candidates[tid].push_back({det, dj, hij, abs_ci, 0.0, heat_bath_score});
                     }
                 }
             }
         } // omp parallel end
+
+        if (sector_constraint) {
+            for (const auto& t : thread_telemetry_pt2) aggregate_telemetry.merge(t);
+        }
 
         if (verbosity >= 2) {
             size_t total_heavy = 0;
@@ -1040,7 +1085,11 @@ pool_build_t(
         }
         final_pool = std::move(kept);
     }
-    
+
+    if (telemetry_out) {
+        *telemetry_out = aggregate_telemetry;
+    }
+
     return {final_pool, threshold};
 }
 
@@ -1096,17 +1145,17 @@ template std::pair<std::vector<DeterminantT<uint64_t>>, double>
 pool_build_t<uint64_t>(const std::vector<DeterminantT<uint64_t>>&, std::vector<double>, int,
                        const std::vector<std::vector<double>>&,
                        const std::vector<double>&,
-                       double, size_t, HijCacheT<uint64_t>&, const std::string&, const std::vector<int>&, int, const PoolBuildParams&, const IntegralSparsityInfo*, const DoubleExcTable*);
+                       double, size_t, HijCacheT<uint64_t>&, const std::string&, const std::vector<int>&, int, const PoolBuildParams&, const IntegralSparsityInfo*, const DoubleExcTable*, const SectorConstraint<uint64_t>*, ScreeningTelemetry*);
 template std::pair<std::vector<DeterminantT<std::array<uint64_t, 2>>>, double>
 pool_build_t<std::array<uint64_t, 2>>(const std::vector<DeterminantT<std::array<uint64_t, 2>>>&, std::vector<double>, int,
                                       const std::vector<std::vector<double>>&,
                                       const std::vector<double>&,
-                                      double, size_t, HijCacheT<std::array<uint64_t, 2>>&, const std::string&, const std::vector<int>&, int, const PoolBuildParams&, const IntegralSparsityInfo*, const DoubleExcTable*);
+                                      double, size_t, HijCacheT<std::array<uint64_t, 2>>&, const std::string&, const std::vector<int>&, int, const PoolBuildParams&, const IntegralSparsityInfo*, const DoubleExcTable*, const SectorConstraint<std::array<uint64_t, 2>>*, ScreeningTelemetry*);
 template std::pair<std::vector<DeterminantT<std::array<uint64_t, 3>>>, double>
 pool_build_t<std::array<uint64_t, 3>>(const std::vector<DeterminantT<std::array<uint64_t, 3>>>&, std::vector<double>, int,
                                       const std::vector<std::vector<double>>&,
                                       const std::vector<double>&,
-                                      double, size_t, HijCacheT<std::array<uint64_t, 3>>&, const std::string&, const std::vector<int>&, int, const PoolBuildParams&, const IntegralSparsityInfo*, const DoubleExcTable*);
+                                      double, size_t, HijCacheT<std::array<uint64_t, 3>>&, const std::string&, const std::vector<int>&, int, const PoolBuildParams&, const IntegralSparsityInfo*, const DoubleExcTable*, const SectorConstraint<std::array<uint64_t, 3>>*, ScreeningTelemetry*);
 
 template std::vector<std::pair<DeterminantT<std::array<uint64_t, 4>>, double>>
 process_parent_worker_t<std::array<uint64_t, 4>>(const DeterminantT<std::array<uint64_t, 4>>&, int, double, const DoubleExcTable&,
@@ -1143,26 +1192,26 @@ template std::pair<std::vector<DeterminantT<std::array<uint64_t, 4>>>, double>
 pool_build_t<std::array<uint64_t, 4>>(const std::vector<DeterminantT<std::array<uint64_t, 4>>>&, std::vector<double>, int,
                                       const std::vector<std::vector<double>>&,
                                       const std::vector<double>&,
-                                      double, size_t, HijCacheT<std::array<uint64_t, 4>>&, const std::string&, const std::vector<int>&, int, const PoolBuildParams&, const IntegralSparsityInfo*, const DoubleExcTable*);
+                                      double, size_t, HijCacheT<std::array<uint64_t, 4>>&, const std::string&, const std::vector<int>&, int, const PoolBuildParams&, const IntegralSparsityInfo*, const DoubleExcTable*, const SectorConstraint<std::array<uint64_t, 4>>*, ScreeningTelemetry*);
 template std::pair<std::vector<DeterminantT<std::array<uint64_t, 5>>>, double>
 pool_build_t<std::array<uint64_t, 5>>(const std::vector<DeterminantT<std::array<uint64_t, 5>>>&, std::vector<double>, int,
                                       const std::vector<std::vector<double>>&,
                                       const std::vector<double>&,
-                                      double, size_t, HijCacheT<std::array<uint64_t, 5>>&, const std::string&, const std::vector<int>&, int, const PoolBuildParams&, const IntegralSparsityInfo*, const DoubleExcTable*);
+                                      double, size_t, HijCacheT<std::array<uint64_t, 5>>&, const std::string&, const std::vector<int>&, int, const PoolBuildParams&, const IntegralSparsityInfo*, const DoubleExcTable*, const SectorConstraint<std::array<uint64_t, 5>>*, ScreeningTelemetry*);
 template std::pair<std::vector<DeterminantT<std::array<uint64_t, 6>>>, double>
 pool_build_t<std::array<uint64_t, 6>>(const std::vector<DeterminantT<std::array<uint64_t, 6>>>&, std::vector<double>, int,
                                       const std::vector<std::vector<double>>&,
                                       const std::vector<double>&,
-                                      double, size_t, HijCacheT<std::array<uint64_t, 6>>&, const std::string&, const std::vector<int>&, int, const PoolBuildParams&, const IntegralSparsityInfo*, const DoubleExcTable*);
+                                      double, size_t, HijCacheT<std::array<uint64_t, 6>>&, const std::string&, const std::vector<int>&, int, const PoolBuildParams&, const IntegralSparsityInfo*, const DoubleExcTable*, const SectorConstraint<std::array<uint64_t, 6>>*, ScreeningTelemetry*);
 template std::pair<std::vector<DeterminantT<std::array<uint64_t, 7>>>, double>
 pool_build_t<std::array<uint64_t, 7>>(const std::vector<DeterminantT<std::array<uint64_t, 7>>>&, std::vector<double>, int,
                                       const std::vector<std::vector<double>>&,
                                       const std::vector<double>&,
-                                      double, size_t, HijCacheT<std::array<uint64_t, 7>>&, const std::string&, const std::vector<int>&, int, const PoolBuildParams&, const IntegralSparsityInfo*, const DoubleExcTable*);
+                                      double, size_t, HijCacheT<std::array<uint64_t, 7>>&, const std::string&, const std::vector<int>&, int, const PoolBuildParams&, const IntegralSparsityInfo*, const DoubleExcTable*, const SectorConstraint<std::array<uint64_t, 7>>*, ScreeningTelemetry*);
 template std::pair<std::vector<DeterminantT<std::array<uint64_t, 8>>>, double>
 pool_build_t<std::array<uint64_t, 8>>(const std::vector<DeterminantT<std::array<uint64_t, 8>>>&, std::vector<double>, int,
                                       const std::vector<std::vector<double>>&,
                                       const std::vector<double>&,
-                                      double, size_t, HijCacheT<std::array<uint64_t, 8>>&, const std::string&, const std::vector<int>&, int, const PoolBuildParams&, const IntegralSparsityInfo*, const DoubleExcTable*);
+                                      double, size_t, HijCacheT<std::array<uint64_t, 8>>&, const std::string&, const std::vector<int>&, int, const PoolBuildParams&, const IntegralSparsityInfo*, const DoubleExcTable*, const SectorConstraint<std::array<uint64_t, 8>>*, ScreeningTelemetry*);
 
 } // namespace trimci_core

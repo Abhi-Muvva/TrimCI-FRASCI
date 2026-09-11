@@ -7,6 +7,7 @@
 #include <string>
 #include "determinant.hpp"
 #include "hamiltonian.hpp"
+#include "sector_constraint.hpp"
 
 namespace trimci_core {
 
@@ -158,7 +159,18 @@ pool_build_t(
     int verbosity,
     const PoolBuildParams& params = {},
     const IntegralSparsityInfo* precomputed_sparsity = nullptr,
-    const DoubleExcTable* precomputed_table = nullptr
+    const DoubleExcTable* precomputed_table = nullptr,
+    // Milestone C2a: nullable typed sector constraint, not a bool+void* pair.
+    // nullptr (the default) is the original, unmodified candidate-generation
+    // path -- every existing caller of pool_build_t is unaffected by this
+    // parameter's addition. Must satisfy sector_constraint->prepared when
+    // non-null (validate_and_prepare_sector_constraint enforces this upstream;
+    // pool_build_t itself does not re-validate).
+    const SectorConstraint<StorageType>* sector_constraint = nullptr,
+    // Nullable telemetry sink. When sector_constraint is provided but this is
+    // null, counters are still accumulated internally (cheap) but discarded --
+    // callers that need them must pass a non-null pointer.
+    ScreeningTelemetry* telemetry_out = nullptr
 );
 
 // Wrapper for backward compatibility
