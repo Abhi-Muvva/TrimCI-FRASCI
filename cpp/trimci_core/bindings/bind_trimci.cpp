@@ -178,6 +178,11 @@ void bind_screening(py::module& m) {
 }
 
 void bind_trim(py::module& m) {
+    m.def("seed_trim_rngs", &seed_trim_rngs, py::arg("seed"),
+          "Reseed the file-scope TRIM partition/Davidson-init RNG streams "
+          "(CPU RNG propagation fix). seed=0 is a no-op (legacy timestamp "
+          "behavior); call once per independent restart for reproducibility.");
+
     // Trim functions for Determinant64 (Default)
     m.def("diagonalize_subspace_davidson", &diagonalize_subspace_davidson,
           py::arg("dets"), py::arg("h1"), py::arg("eri"),

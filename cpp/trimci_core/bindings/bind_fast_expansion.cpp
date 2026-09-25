@@ -412,6 +412,7 @@ void bind_fast_expansion(py::module& m) {
         .def_readwrite("sector_constraint", &ExpansionConfig<uint64_t>::sector_constraint)
         .def_readwrite("recovery", &ExpansionConfig<uint64_t>::recovery)
         .def_readwrite("phase_index", &ExpansionConfig<uint64_t>::phase_index)
+        .def_readwrite("allowed_orbital_pairs", &ExpansionConfig<uint64_t>::allowed_orbital_pairs)
         .def_property("pt2_config",
             [](const ExpansionConfig<uint64_t>& c) -> py::object {
                 if (c.pt2_config.has_value()) return py::cast(c.pt2_config.value());
@@ -652,6 +653,7 @@ void bind_fast_expansion(py::module& m) {
         .def_readwrite("sector_constraint", &Cfg128::sector_constraint)
         .def_readwrite("recovery", &Cfg128::recovery)
         .def_readwrite("phase_index", &Cfg128::phase_index)
+        .def_readwrite("allowed_orbital_pairs", &Cfg128::allowed_orbital_pairs)
         .def_property("pt2_config",
             [](const Cfg128& c) -> py::object {
                 if (c.pt2_config.has_value()) return py::cast(c.pt2_config.value());

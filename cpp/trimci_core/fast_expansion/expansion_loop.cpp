@@ -993,7 +993,7 @@ ExpansionResult<StorageType> run_expansion(
                     true, 6, 0.5, 0.0,
                     1e-3, 200,
                     true, false,
-                    fe_diag);
+                    fe_diag, config.allowed_orbital_pairs);
 
             double t_orbopt_s = std::chrono::duration<double>(Clock::now() - t_orbopt).count();
 

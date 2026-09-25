@@ -319,8 +319,14 @@ def iterative_workflow(h1, eri, n_alpha, n_beta, n_orb,
         initial_coeffs.extend(p_coeffs)
 
     if initial_dets_dict is not None:
+        # CPU RNG propagation fix: thread params.random_seed (already set
+        # from args.random_seed above) into the "random"/"random_closed_
+        # shell"/"random_excited" initial-determinant draw. 0 -> None (no
+        # seed override, legacy unseeded behavior), matching this file's own
+        # existing "random_seed=0/None -> system time" convention.
+        _initial_dets_seed = int(params.random_seed) or None
         gen_dets, gen_coeffs = generate_initial_states(
-            n_alpha, n_beta, n_orb, initial_dets_dict)
+            n_alpha, n_beta, n_orb, initial_dets_dict, seed=_initial_dets_seed)
         initial_dets.extend(gen_dets)
         initial_coeffs.extend(gen_coeffs)
 
@@ -347,6 +353,13 @@ def iterative_workflow(h1, eri, n_alpha, n_beta, n_orb,
     # Call C++ backend
     # =========================================================================
     log_important(f"Starting C++ iterative_workflow with {len(initial_dets)} initial dets")
+
+    # CPU RNG propagation fix: reseed the file-scope TRIM-partition/Davidson-
+    # init RNG streams from the SAME random_seed just threaded into
+    # generate_initial_states above, so the entire run (initial dets AND the
+    # C++ TRIM/Davidson randomness) is reproducible from one seed value.
+    # seed=0 is a no-op inside seed_trim_rngs (legacy timestamp behavior).
+    trimci_core.seed_trim_rngs(int(params.random_seed))
 
     cpp_result = iterative_workflow_cpp(
         h1, eri, n_alpha, n_beta, n_orb,

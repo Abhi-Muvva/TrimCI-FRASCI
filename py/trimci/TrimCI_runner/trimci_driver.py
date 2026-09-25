@@ -483,8 +483,21 @@ def _run_multi_gpu(h1, eri, n_alpha, n_beta, n_orb, mol_name, args, nuclear_repu
 
 
 def _run_multi_cpu(h1, eri, n_alpha, n_beta, n_orb, mol_name, args, nuclear_repulsion, folder, num_runs):
-    """Sequential multi-run execution (CPU backend)."""
+    """Sequential multi-run execution (CPU backend).
+
+    CPU RNG propagation fix: previously every run_idx called iterative_
+    workflow with the SAME shared ``args`` (and hence the same, or absent,
+    ``random_seed``) -- each of the N "independent" restarts was only
+    independent because the underlying RNGs were unseeded (wall-clock), not
+    because of any per-run seed derivation. This mirrors _run_multi_gpu's
+    existing per-run seed derivation (master_seed + run_idx * golden-ratio
+    constant) so the CPU path is reproducible run-for-run given the same
+    master args.random_seed, exactly like the GPU path already is.
+    """
+    import copy
     import shutil
+
+    master_seed = int(getattr(args, 'random_seed', 0) or 0)
 
     log_important(f"Running {num_runs} independent calculations to find the best result...")
 
@@ -516,8 +529,16 @@ def _run_multi_cpu(h1, eri, n_alpha, n_beta, n_orb, mol_name, args, nuclear_repu
         start_total = time.perf_counter()
         log_important(f"Starting run {run_idx + 1}/{num_runs}")
 
+        # master_seed==0 -> every run stays at seed 0 (legacy unseeded
+        # behavior, unchanged); master_seed!=0 -> each run gets its own
+        # reproducible, independently-derived seed.
+        per_run_args = copy.copy(args)
+        per_run_args.random_seed = (
+            (master_seed + run_idx * 0x9e3779b97f4a7c15) & 0xFFFFFFFFFFFFFFFF
+            if master_seed else 0)
+
         final_energy, current_dets, current_coeffs, iteration_details, run_args = iterative_workflow(
-            h1, eri, n_alpha, n_beta, n_orb, mol_name, args, nuclear_repulsion, start_total, multi_run_folder
+            h1, eri, n_alpha, n_beta, n_orb, mol_name, per_run_args, nuclear_repulsion, start_total, multi_run_folder
         )
 
         results_dir = iteration_details.get('results_dir', '')

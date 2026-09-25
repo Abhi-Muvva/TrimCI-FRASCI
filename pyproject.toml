@@ -44,10 +44,11 @@ chem = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/hao-zhang-quantum/TrimCI"
-Repository = "https://github.com/hao-zhang-quantum/TrimCI"
-Documentation = "https://github.com/hao-zhang-quantum/TrimCI#readme"
-"Bug Tracker" = "https://github.com/hao-zhang-quantum/TrimCI/issues"
+Homepage = "https://github.com/Abhi-Muvva/TrimCI-FRASCI"
+Repository = "https://github.com/Abhi-Muvva/TrimCI-FRASCI"
+Documentation = "https://github.com/Abhi-Muvva/TrimCI-FRASCI#readme"
+"Bug Tracker" = "https://github.com/Abhi-Muvva/TrimCI-FRASCI/issues"
+Upstream = "https://github.com/hao-zhang-quantum/TrimCI"
 
 [tool.setuptools.packages.find]
 where = ["."]  # list of folders that contain the packages (["src"] by default)

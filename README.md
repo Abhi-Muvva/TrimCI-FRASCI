@@ -6,6 +6,16 @@
 
 # TrimCI
 
+> **This is the FRASCI-specific development fork of TrimCI.** It is used by the FRASCI
+> (FRAgment-based Selected CI) framework's `frasci.parent`/`frasci.recovery` packages,
+> and is based on upstream [`hao-zhang-quantum/TrimCI`](https://github.com/hao-zhang-quantum/TrimCI)
+> (this repository's `upstream` remote), from which it retains full commit history.
+> These modifications have not been proposed to or reviewed by the upstream maintainer
+> yet, so this repository must **not** be presented as an official upstream TrimCI
+> release. Original authorship and the MIT license (below) remain unchanged. FRASCI
+> releases pin an exact commit of this repository for reproducibility — see
+> "FRASCI-specific changes" below.
+
 > 🔥 **v0.2.0 (May 2026):** Now supports **orbital optimization** and **fast expansion**. The complete three-phase workflow is exposed via the friendly `trimci.ground_state(...)` entry, or the production-grade `TrimCI_skill.py` template. Just `pip install trimci`.
 
 **Trimmed Configuration Interaction (TrimCI)** is a **high-performance** framework for quantum many-body and quantum chemistry calculation.
@@ -112,6 +122,48 @@ TrimCI provides a compact and explicit coefficients and determinants dict that c
 - enable cross-validation and hybrid workflows across classical and quantum domains.
 
 ---
+
+## 🧬 FRASCI-specific changes
+
+Already on this fork's committed `main` branch (built on upstream `v0.2.0`):
+
+1. **Native recovery policy and sector-constraint support** (`RecoveryPolicy`,
+   `SectorConstraint`, `make_sector_constraint_64`/`_128`) — lets a caller protect a
+   fragment-derived determinant set and grow only a bounded, classified pool of
+   additional (same-sector/dispersion/charge-transfer) determinants around it.
+2. **Phased native expansion** (`ExpansionConfig`, `run_expansion_phased`/`_128`) — the
+   multi-phase Phase-0/1/2 expansion entry point the parent/recovery workflows above
+   drive directly, rather than the single-phase `ground_state` wrapper.
+
+Added on top, currently uncommitted in this checkout (staged for the same commit as the
+two items above):
+
+3. **`ExpansionConfig.allowed_orbital_pairs`** — restricts BFGS orbital-pair rotation to
+   a caller-supplied allowlist of `(p, q)` index pairs, so an orbital optimization can be
+   confined to (for example) intra-fragment pairs and preserve a requested orbital gauge
+   instead of rotating freely across the whole space.
+4. **`seed_trim_rngs(seed)`, plus Python-level seed propagation** — reseeds the
+   previously timestamp-only, unreseedable file-scope RNG streams behind partition
+   shuffling and Davidson initialization, so independent CPU restarts (and CPU-side
+   partitioning) become reproducible given a fixed seed. Previously
+   `IterativeWorkflowParams.random_seed` was accepted and stored but never actually read
+   on the CPU single/multi-run path.
+5. **Validation of `allowed_orbital_pairs`** — rejects out-of-range orbital indices and
+   duplicate pairs before an optimization run starts, rather than failing (or
+   silently misbehaving) partway through.
+
+## 📦 Install (this fork)
+
+```bash
+python -m pip install "trimci @ git+https://github.com/Abhi-Muvva/TrimCI-FRASCI.git@main"
+```
+
+FRASCI itself pins a **full commit SHA** of this repository, not a branch name, for
+reproducibility (see FRASCI's own `pyproject.toml`/`requirements.txt`). The branch
+install above is only a convenience for exploring this fork directly. Installing from a
+private GitHub repository requires an authenticated `git`/`pip` setup for
+`github.com` — `gh auth login` (HTTPS) or an SSH key registered to your GitHub account
+both work.
 
 ## 📚 Version history
 

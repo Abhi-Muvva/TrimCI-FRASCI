@@ -118,6 +118,7 @@ orbital_bfgs_optimize_t(
     int davidson_max_iter = 200,
     bool rotate_integrals = true,
     bool record_trace = false,
-    DiagFunc<StorageType> diag_func = nullptr);
+    DiagFunc<StorageType> diag_func = nullptr,
+    const std::vector<std::pair<int, int>>& allowed_pairs = {});
 
 } // namespace trimci_core

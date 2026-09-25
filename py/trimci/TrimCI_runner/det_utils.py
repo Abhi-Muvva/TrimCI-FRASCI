@@ -275,7 +275,8 @@ def _get_n_segments(DeterminantClass):
 
 def generate_initial_states(n_alpha, n_beta, n_orb,
                             initial_dets_dict=None,
-                            save_path=None):
+                            save_path=None,
+                            seed=None):
     """
     Generate initial determinants and coefficients for TrimCI.
 
@@ -291,6 +292,12 @@ def generate_initial_states(n_alpha, n_beta, n_orb,
                         "random", "random_closed_shell", "random_excited", "bitstring"
     save_path : str or None
         If given, save dets.npz to this path.
+    seed : int or None
+        CPU RNG propagation fix: if given, seeds the "random"/
+        "random_closed_shell"/"random_excited" determinant draws below
+        reproducibly. None (default) preserves the prior unseeded behavior
+        (fresh OS entropy every call) -- this parameter is additive, not a
+        behavior change for existing callers that don't pass it.
 
     Returns
     -------
@@ -300,7 +307,7 @@ def generate_initial_states(n_alpha, n_beta, n_orb,
     from trimci import get_functions_for_system
 
     dets, coeffs = [], []
-    rng = np.random.default_rng()
+    rng = np.random.default_rng(seed)
 
     functions = get_functions_for_system(n_orb)
     DeterminantClass = functions['determinant_class']

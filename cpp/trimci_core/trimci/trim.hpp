@@ -59,6 +59,11 @@ partition_pool_t(const std::vector<DeterminantT<StorageType>>& pool, int m);
 std::vector<std::vector<Determinant>>
 partition_pool(const std::vector<Determinant>& pool, int m);
 
+// Reseed the file-scope TRIM partition/Davidson-init RNG streams
+// (thread_local; see trim.cpp for the CPU-RNG-propagation fix rationale).
+// seed==0 is a no-op (keeps legacy timestamp-seeded behavior).
+void seed_trim_rngs(uint64_t seed);
+
 // =================================================================================
 // 2) Template: diagonalize_subspace_davidson_t
 // =================================================================================

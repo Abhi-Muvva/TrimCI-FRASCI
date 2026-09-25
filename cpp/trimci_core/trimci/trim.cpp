@@ -44,6 +44,39 @@ using Vec     = Eigen::VectorXd;
 using Mat     = Eigen::MatrixXd;
 
 // =================================================================================
+// CPU RNG propagation fix: file-scope, explicitly reseedable RNG streams.
+//
+// Previously every randomized site below (partition_pool_t's shuffle, and
+// davidson_solve's four random-init strategies) constructed its own
+// ``static thread_local std::mt19937_64 rng{timestamp_seed()}`` -- seeded
+// once from wall-clock time on first use per thread, with no way to reseed
+// for a later, independent top-level run in the same thread/process.
+// ``IterativeWorkflowParams::random_seed`` was accepted from Python and
+// stored, but nothing in this file ever read it, so it was a dead field on
+// the CPU single/multi-run path (confirmed: only the GPU multi-run path
+// read it, to derive per-run seeds for ITS OWN separate bookkeeping).
+//
+// Fix: promote the RNGs to file-scope thread_local streams, and expose
+// ``seed_trim_rngs`` so Python can explicitly reseed them at the start of
+// each independent restart, deriving the seed from
+// ``IterativeWorkflowParams::random_seed``/``Config.seed`` (already
+// correctly threaded through the Python layer -- see trimci_driver.py).
+// seed==0 is treated as "no override" (legacy timestamp-seeded behavior),
+// matching this codebase's existing "random_seed=0/None -> system time"
+// convention (see iterative_workflow.py's own loaded_dets_randomness code).
+// The two streams are seeded from independent derived values so partition
+// shuffling and Davidson initialization don't share a sequence.
+// =================================================================================
+thread_local std::mt19937_64 g_partition_rng{timestamp_seed()};
+thread_local std::mt19937_64 g_davidson_rng{timestamp_seed()};
+
+void seed_trim_rngs(uint64_t seed) {
+    if (seed == 0) return;  // 0 = no override, keep legacy timestamp behavior
+    g_partition_rng.seed(seed);
+    g_davidson_rng.seed(splitmix64(seed ^ 0x9E3779B97F4A7C15ULL));
+}
+
+// =================================================================================
 // 1) partition_pool_t
 // =================================================================================
 template<typename StorageType>
@@ -56,9 +89,8 @@ partition_pool_t(const std::vector<DeterminantT<StorageType>>& pool, int m)
     std::vector<size_t> idx(n);
     std::iota(idx.begin(), idx.end(), 0);
 
-    // Use thread_local RNG for thread safety.
-    static thread_local std::mt19937_64 rng{ timestamp_seed() };
-    std::shuffle(idx.begin(), idx.end(), rng);
+    // File-scope, explicitly reseedable RNG (see seed_trim_rngs above).
+    std::shuffle(idx.begin(), idx.end(), g_partition_rng);
 
     std::vector<std::vector<DeterminantT<StorageType>>> subsets(m);
     size_t base = (n + m - 1) / m;
@@ -509,30 +541,27 @@ davidson_solve(
         }
         v0(min_idx) = 1.0;
         if (init_strategy == "lowest_diag_noise") {
-            static thread_local std::mt19937_64 rng_ld{timestamp_seed()};
             std::normal_distribution<double> dist(0.0, 0.01);
-            for (int i = 0; i < dim; ++i) v0(i) += dist(rng_ld);
+            for (int i = 0; i < dim; ++i) v0(i) += dist(g_davidson_rng);
         }
         v0.normalize();
         if (verbosity >= 2)
             std::cout << "  [Davidson] Init: " << init_strategy
                       << " (idx=" << min_idx << ", H_ii=" << min_val << ")\n";
     } else if (init_strategy == "random") {
-        static thread_local std::mt19937_64 rng_r{timestamp_seed()};
         std::normal_distribution<double> dist(0.0, 1.0);
-        for (int i = 0; i < dim; ++i) v0(i) = dist(rng_r);
+        for (int i = 0; i < dim; ++i) v0(i) = dist(g_davidson_rng);
         v0.normalize();
         if (verbosity >= 2) std::cout << "  [Davidson] Init: random\n";
     } else if (init_strategy == "multi_random") {
         // Run Davidson with multiple random starts, keep best
-        static thread_local std::mt19937_64 rng_mr{timestamp_seed()};
         std::normal_distribution<double> dist(0.0, 1.0);
         double best_e = std::numeric_limits<double>::infinity();
         Vec best_v;
         const int n_trials = 5;
         for (int trial = 0; trial < n_trials; ++trial) {
             Vec vt = Vec::Zero(dim);
-            for (int i = 0; i < dim; ++i) vt(i) = dist(rng_mr);
+            for (int i = 0; i < dim; ++i) vt(i) = dist(g_davidson_rng);
             vt.normalize();
             // Quick Davidson with fewer iterations
             auto [e_trial, c_trial] = davidson_solve(H, dim,
@@ -556,9 +585,8 @@ davidson_solve(
             used_warm = true;
             if (verbosity >= 2) std::cout << "  [Davidson] Init: warm start\n";
         } else {
-            static thread_local std::mt19937_64 rng_f{timestamp_seed()};
             std::normal_distribution<double> dist(0.0, 1.0);
-            for (int i = 0; i < dim; ++i) v0(i) = dist(rng_f);
+            for (int i = 0; i < dim; ++i) v0(i) = dist(g_davidson_rng);
             v0.normalize();
             if (verbosity >= 2) std::cout << "  [Davidson] Init: random (no warm data)\n";
         }

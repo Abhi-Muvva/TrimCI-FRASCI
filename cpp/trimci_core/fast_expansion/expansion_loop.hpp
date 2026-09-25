@@ -137,6 +137,15 @@ struct ExpansionConfig {
     // phase; a standalone run_expansion call may set it itself).
     int phase_index = 1;
 
+    // Experimental: fragment-gauge-preserving COO. When nonempty, restricts the BFGS
+    // orbital-rotation parameter set inside orbital_bfgs_optimize_t to exactly these
+    // (p, q) pairs — every other kappa[p,q] stays fixed at zero for the whole
+    // optimization, so a caller can request "rotate only within these orbital blocks."
+    // Each pair must satisfy 0 <= p < q < n_orb with no duplicates (validated where the
+    // field is consumed, not here). Empty (the default) reproduces the original
+    // unrestricted all-pairs behavior exactly.
+    std::vector<std::pair<int, int>> allowed_orbital_pairs;
+
     // Output
     int verbose = 1;
     std::string log_file;  // if non-empty, tee all output to this file (real-time flush)

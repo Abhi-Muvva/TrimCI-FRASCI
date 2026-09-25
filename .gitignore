@@ -44,6 +44,9 @@ realtime_progress.out
 # IDE / editor
 .vscode/
 
+# graphify knowledge-graph cache (FRASCI-side tooling, not part of TrimCI)
+graphify-out/
+
 # Packaging staging and tarballs at repo root
 _pack/
 /*.tar.gz

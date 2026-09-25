@@ -6,6 +6,7 @@
 #include <cmath>
 #include <iomanip>
 #include <iostream>
+#include <set>
 #include <unordered_map>
 
 #include "omp_compat.hpp"
@@ -1096,7 +1097,8 @@ orbital_bfgs_optimize_t(
     int davidson_max_iter,
     bool rotate_integrals,
     bool record_trace,
-    DiagFunc<StorageType> diag_func) {
+    DiagFunc<StorageType> diag_func,
+    const std::vector<std::pair<int, int>>& allowed_pairs) {
     Eigen::MatrixXd rot_total;
     std::vector<std::vector<double>> h1_out;
     std::vector<double> eri_out;
@@ -1147,11 +1149,30 @@ orbital_bfgs_optimize_t(
     }
 
     std::vector<std::pair<int, int>> param_indices;
-    param_indices.reserve(static_cast<size_t>(n_orb_use * (n_orb_use - 1) / 2));
-    for (int i = 0; i < n_orb_use; ++i) {
-        for (int j = i + 1; j < n_orb_use; ++j) {
-            param_indices.emplace_back(i, j);
+    if (allowed_pairs.empty()) {
+        param_indices.reserve(static_cast<size_t>(n_orb_use * (n_orb_use - 1) / 2));
+        for (int i = 0; i < n_orb_use; ++i) {
+            for (int j = i + 1; j < n_orb_use; ++j) {
+                param_indices.emplace_back(i, j);
+            }
         }
+    } else {
+        std::set<std::pair<int, int>> seen;
+        for (const auto& pair : allowed_pairs) {
+            int p = pair.first, q = pair.second;
+            if (p < 0 || q < 0 || p >= n_orb_use || q >= n_orb_use || p >= q) {
+                throw std::invalid_argument(
+                    "orbital_bfgs_optimize_t: allowed_pairs entry (" + std::to_string(p) +
+                    ", " + std::to_string(q) + ") violates 0 <= p < q < n_orb (n_orb=" +
+                    std::to_string(n_orb_use) + ")");
+            }
+            if (!seen.insert(pair).second) {
+                throw std::invalid_argument(
+                    "orbital_bfgs_optimize_t: allowed_pairs contains duplicate (" +
+                    std::to_string(p) + ", " + std::to_string(q) + ")");
+            }
+        }
+        param_indices = allowed_pairs;
     }
 
     auto connections = detail::build_connections_upper_t(dets, n_orb_use);
@@ -1661,7 +1682,8 @@ orbital_bfgs_optimize_t<uint64_t>(
     const std::vector<double>&,
     const std::vector<std::vector<double>>&,
     const std::vector<double>&,
-    int, int, int, int, double, double, double, double, double, double, double, double, double, double, double, bool, int, double, double, double, int, bool, bool, DiagFunc<uint64_t>);
+    int, int, int, int, double, double, double, double, double, double, double, double, double, double, double, bool, int, double, double, double, int, bool, bool, DiagFunc<uint64_t>,
+    const std::vector<std::pair<int, int>>&);
 template std::tuple<Eigen::MatrixXd,
                     std::vector<std::vector<double>>,
                     std::vector<double>,
@@ -1675,7 +1697,8 @@ orbital_bfgs_optimize_t<std::array<uint64_t, 2>>(
     const std::vector<double>&,
     const std::vector<std::vector<double>>&,
     const std::vector<double>&,
-    int, int, int, int, double, double, double, double, double, double, double, double, double, double, double, bool, int, double, double, double, int, bool, bool, DiagFunc<std::array<uint64_t, 2>>);
+    int, int, int, int, double, double, double, double, double, double, double, double, double, double, double, bool, int, double, double, double, int, bool, bool, DiagFunc<std::array<uint64_t, 2>>,
+    const std::vector<std::pair<int, int>>&);
 template std::tuple<Eigen::MatrixXd,
                     std::vector<std::vector<double>>,
                     std::vector<double>,
@@ -1689,7 +1712,8 @@ orbital_bfgs_optimize_t<std::array<uint64_t, 3>>(
     const std::vector<double>&,
     const std::vector<std::vector<double>>&,
     const std::vector<double>&,
-    int, int, int, int, double, double, double, double, double, double, double, double, double, double, double, bool, int, double, double, double, int, bool, bool, DiagFunc<std::array<uint64_t, 3>>);
+    int, int, int, int, double, double, double, double, double, double, double, double, double, double, double, bool, int, double, double, double, int, bool, bool, DiagFunc<std::array<uint64_t, 3>>,
+    const std::vector<std::pair<int, int>>&);
 template std::tuple<Eigen::MatrixXd,
                     std::vector<std::vector<double>>,
                     std::vector<double>,
@@ -1703,7 +1727,8 @@ orbital_bfgs_optimize_t<std::array<uint64_t, 4>>(
     const std::vector<double>&,
     const std::vector<std::vector<double>>&,
     const std::vector<double>&,
-    int, int, int, int, double, double, double, double, double, double, double, double, double, double, double, bool, int, double, double, double, int, bool, bool, DiagFunc<std::array<uint64_t, 4>>);
+    int, int, int, int, double, double, double, double, double, double, double, double, double, double, double, bool, int, double, double, double, int, bool, bool, DiagFunc<std::array<uint64_t, 4>>,
+    const std::vector<std::pair<int, int>>&);
 template std::tuple<Eigen::MatrixXd,
                     std::vector<std::vector<double>>,
                     std::vector<double>,
@@ -1717,7 +1742,8 @@ orbital_bfgs_optimize_t<std::array<uint64_t, 5>>(
     const std::vector<double>&,
     const std::vector<std::vector<double>>&,
     const std::vector<double>&,
-    int, int, int, int, double, double, double, double, double, double, double, double, double, double, double, bool, int, double, double, double, int, bool, bool, DiagFunc<std::array<uint64_t, 5>>);
+    int, int, int, int, double, double, double, double, double, double, double, double, double, double, double, bool, int, double, double, double, int, bool, bool, DiagFunc<std::array<uint64_t, 5>>,
+    const std::vector<std::pair<int, int>>&);
 template std::tuple<Eigen::MatrixXd,
                     std::vector<std::vector<double>>,
                     std::vector<double>,
@@ -1731,7 +1757,8 @@ orbital_bfgs_optimize_t<std::array<uint64_t, 6>>(
     const std::vector<double>&,
     const std::vector<std::vector<double>>&,
     const std::vector<double>&,
-    int, int, int, int, double, double, double, double, double, double, double, double, double, double, double, bool, int, double, double, double, int, bool, bool, DiagFunc<std::array<uint64_t, 6>>);
+    int, int, int, int, double, double, double, double, double, double, double, double, double, double, double, bool, int, double, double, double, int, bool, bool, DiagFunc<std::array<uint64_t, 6>>,
+    const std::vector<std::pair<int, int>>&);
 template std::tuple<Eigen::MatrixXd,
                     std::vector<std::vector<double>>,
                     std::vector<double>,
@@ -1745,7 +1772,8 @@ orbital_bfgs_optimize_t<std::array<uint64_t, 7>>(
     const std::vector<double>&,
     const std::vector<std::vector<double>>&,
     const std::vector<double>&,
-    int, int, int, int, double, double, double, double, double, double, double, double, double, double, double, bool, int, double, double, double, int, bool, bool, DiagFunc<std::array<uint64_t, 7>>);
+    int, int, int, int, double, double, double, double, double, double, double, double, double, double, double, bool, int, double, double, double, int, bool, bool, DiagFunc<std::array<uint64_t, 7>>,
+    const std::vector<std::pair<int, int>>&);
 template std::tuple<Eigen::MatrixXd,
                     std::vector<std::vector<double>>,
                     std::vector<double>,
@@ -1759,6 +1787,7 @@ orbital_bfgs_optimize_t<std::array<uint64_t, 8>>(
     const std::vector<double>&,
     const std::vector<std::vector<double>>&,
     const std::vector<double>&,
-    int, int, int, int, double, double, double, double, double, double, double, double, double, double, double, bool, int, double, double, double, int, bool, bool, DiagFunc<std::array<uint64_t, 8>>);
+    int, int, int, int, double, double, double, double, double, double, double, double, double, double, double, bool, int, double, double, double, int, bool, bool, DiagFunc<std::array<uint64_t, 8>>,
+    const std::vector<std::pair<int, int>>&);
 
 } // namespace trimci_core
